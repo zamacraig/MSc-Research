@@ -1,0 +1,17 @@
+Top 5 grid runs (sorted by f1 then accuracy)
+------------------------------------------------------------
+Rank 1: run_id=run1_1765903083, f1=0.7768, acc=0.7931
+  params: {"epochs": 20, "lr": 0.001, "weight_decay": 0.001, "hidden_channels": 16, "in_channels": 8, "num_classes": 5, "train_ratio": 0.8, "seed": 42, "device": null}
+
+Rank 2: run_id=run3_1765903118, f1=0.7731, acc=0.7893
+  params: {"epochs": 20, "lr": 0.001, "weight_decay": 0.0005, "hidden_channels": 16, "in_channels": 8, "num_classes": 5, "train_ratio": 0.8, "seed": 42, "device": null}
+
+Rank 3: run_id=run1_1765902390, f1=0.7633, acc=0.7778
+  params: {"epochs": 200, "lr": 0.001, "weight_decay": 0.0005, "hidden_channels": 16, "in_channels": 8, "num_classes": 5, "train_ratio": 0.8, "seed": 42, "device": null}
+
+Rank 4: run_id=run4_1765903139, f1=0.7230, acc=0.7318
+  params: {"epochs": 20, "lr": 0.001, "weight_decay": 0.0005, "hidden_channels": 32, "in_channels": 8, "num_classes": 5, "train_ratio": 0.8, "seed": 42, "device": null}
+
+Rank 5: run_id=run2_1765903100, f1=0.6886, acc=0.7165
+  params: {"epochs": 20, "lr": 0.001, "weight_decay": 0.001, "hidden_channels": 32, "in_channels": 8, "num_classes": 5, "train_ratio": 0.8, "seed": 42, "device": null}
+

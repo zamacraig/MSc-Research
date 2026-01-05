@@ -1,6 +1,13 @@
 
+import json
+from pathlib import Path
 import torch
 import torch.optim as optim
+from datetime import datetime
+import itertools
+import csv
+import time
+import os
 import torch.nn as nn
 import numpy as np
 import pandas as pd
@@ -132,7 +139,7 @@ def create_temporal_dataset(final_df):
     )
 
 
-def train(model, optimizer, criterion, train_loader):
+def train(model, optimizer, criterion, train_loader, grad_clip=None):
     model.train()
     total_loss = 0
     print("Starting training epoch...")
@@ -145,6 +152,8 @@ def train(model, optimizer, criterion, train_loader):
         targets_long = snapshot.y.clone().to(torch.long)
         loss = criterion(out, targets_long)
         loss.backward()
+        if grad_clip is not None and float(grad_clip) > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
         optimizer.step()
         total_loss += loss.item()
     print("Training epoch finished.")
@@ -168,15 +177,55 @@ def test(model, loader):
 
 import matplotlib.pyplot as plt
 
+def load_config():
+    """Load config.json located next to this script and return as dict."""
+    config_path = Path(__file__).with_name('config.json')
+    cfg = {}
+    if config_path.exists():
+        try:
+            with config_path.open('r') as fh:
+                cfg = json.load(fh)
+        except Exception:
+            cfg = {}
+    return cfg
+
+
 def main():
+    """Main function to run the training and evaluation pipeline.
+    Configuration is loaded directly from `config.json` located next to this script.
     """
-    Main function to run the training and evaluation pipeline.
-    """
+    cfg = load_config()
     try:
         from data_loader import load_and_preprocess_data
         from graph_constructor import create_graph_data
 
-        # Load and create graph data
+        # Build parameter grid from config (list-valued entries become grid dimensions)
+        def generate_param_grid(cfg_in):
+            list_keys = [k for k, v in cfg_in.items() if isinstance(v, list) and len(v) > 0]
+            if not list_keys:
+                return [cfg_in.copy()]
+            pools = [cfg_in[k] for k in list_keys]
+            grids = []
+            for vals in itertools.product(*pools):
+                c = cfg_in.copy()
+                for k, v in zip(list_keys, vals):
+                    c[k] = v
+                grids.append(c)
+            return grids
+
+        grid = generate_param_grid(cfg)
+        if not grid:
+            grid = [cfg]
+
+        # Output directory and results file
+        save_dir = Path(cfg.get('save_dir', Path(__file__).parent))
+        save_dir.mkdir(parents=True, exist_ok=True)
+        results_path = save_dir / 'grid_results.csv'
+        header = ['run_id', 'params', 'accuracy', 'f1', 'model_path', 'best_model_path', 'best_f1', 'duration_seconds']
+
+        # reproducibility seed will be set per-run below
+
+        # Load data once (heavy operations)
         print("Loading and preprocessing data...")
         attribute_df, node_df = load_and_preprocess_data(base_path="../..")
         print("Data loading and preprocessing complete.")
@@ -202,24 +251,24 @@ def main():
 
         print("\nCreating graph data...")
         #final_df = create_graph_data(attribute_df, node_df)
-        final_df = pd.read_csv('../../../Dataset/TransientData/corrected1_df.csv')    
+        data_path = cfg.get('data_path', '../../../Dataset/TransientData/corrected1_df.csv')
+        final_df = pd.read_csv(data_path)
         print("Graph data creation complete.")
 
         # --- Generate and Save Plot ---
-        print("\nGenerating plot of nodes per timestamp...")
-        nodes_per_timestamp = final_df.groupby('TimeStamp')['Compno_x'].nunique()
-        
-        plt.figure(figsize=(15, 7))
-        nodes_per_timestamp.plot(kind='bar')
-        plt.title('Number of Nodes per Timestamp')
-        plt.xlabel('Timestamp')
-        plt.ylabel('Number of Nodes')
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        
-        plot_path = 'nodes_per_timestamp.png'
-        plt.savefig(plot_path)
-        print(f"Plot saved to {plot_path}\n")
+        if cfg.get('plot_nodes_per_timestamp', True):
+            print("\nGenerating plot of nodes per timestamp...")
+            nodes_per_timestamp = final_df.groupby('TimeStamp')['Compno_x'].nunique()
+            plt.figure(figsize=(15, 7))
+            nodes_per_timestamp.plot(kind='bar')
+            plt.title('Number of Nodes per Timestamp')
+            plt.xlabel('Timestamp')
+            plt.ylabel('Number of Nodes')
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            plot_path = save_dir / 'nodes_per_timestamp.png'
+            plt.savefig(plot_path)
+            print(f"Plot saved to {plot_path}\n")
         # --------------------------------
 
         
@@ -230,45 +279,143 @@ def main():
         print("="*50)
         print(dataset)
         
-        print("\nSplitting dataset into training and testing sets...")
-        train_dataset, test_dataset = temporal_signal_split(dataset, train_ratio=0.8)
-        print("Dataset splitting complete.")
+        # Run grid of experiments (if config contains list-valued hyperparameters)
+        for run_idx, cfg_run in enumerate(grid, start=1):
+            run_prefix = cfg.get('run_name', 'run')
+            run_id = f"{run_prefix}{run_idx}_{int(time.time())}"
+            print(f"\n=== Starting grid run {run_idx}/{len(grid)} ({run_id}) ===")
 
-        # Create a custom data loader
-        train_loader = TemporalDataLoader(train_dataset)
-        test_loader = TemporalDataLoader(test_dataset)
+            # set per-run seed
+            seed = int(cfg_run.get('seed', cfg.get('seed', 42)))
+            torch.manual_seed(seed)
+            np.random.seed(seed)
 
-        # --- Model, Optimizer, Criterion ---
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"\nUsing device: {device}")
-        model = TemporalSpatialNodeClassifier(in_channels=8, hidden_channels=16, num_classes=5).to(device)
-        
-        print("\n" + "="*50)
-        print(" " * 15 + "MODEL ARCHITECTURE")
-        print("="*50)
-        print(model)
-        print("="*50 + "\n")
+            # Split dataset according to this run's train ratio
+            print("\nSplitting dataset into training and testing sets...")
+            train_dataset, test_dataset = temporal_signal_split(dataset, train_ratio=cfg_run.get('train_ratio', cfg.get('train_ratio', 0.8)))
+            print("Dataset splitting complete.")
 
-        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4)
-        criterion = nn.CrossEntropyLoss()
+            train_loader = TemporalDataLoader(train_dataset)
+            test_loader = TemporalDataLoader(test_dataset)
 
-        # --- Training Loop ---
-        print("Starting model training...")
-        for epoch in range(1, 201):
-            print(f"\nEpoch {epoch}/200")
-            loss = train(model, optimizer, criterion, train_dataset)
-            
-            preds, labels = test(model, test_dataset)
-            accuracy = accuracy_score(labels, preds)
-            f1 = f1_score(labels, preds, average='weighted')
-            print(f"Epoch {epoch:03d} | Train Loss: {loss:.4f} | Test Acc: {accuracy:.4f} | Test F1: {f1:.4f}")
-        print("Model training finished.")
-                
-        # --- Save Model ---
-        model_save_path = "temporal_spatial_classifier_state.pth"
-        print(f"Saving model to {model_save_path}...")
-        torch.save(model.state_dict(), model_save_path)
-        print(f"Model saved to {model_save_path}")
+            # Device selection
+            cfg_device = cfg_run.get('device', cfg.get('device', None))
+            if cfg_device == 'cpu':
+                device = torch.device('cpu')
+            elif cfg_device == 'cuda':
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            else:
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            print(f"\nUsing device: {device}")
+
+            # Model
+            model = TemporalSpatialNodeClassifier(
+                in_channels=int(cfg_run.get('in_channels', cfg.get('in_channels', 8))),
+                hidden_channels=int(cfg_run.get('hidden_channels', cfg.get('hidden_channels', 16))),
+                num_classes=int(cfg_run.get('num_classes', cfg.get('num_classes', 5)))
+            ).to(device)
+            print("\n" + "="*50)
+            print(" " * 15 + "MODEL ARCHITECTURE")
+            print("="*50)
+            print(model)
+            print("="*50 + "\n")
+
+            opt_name = str(cfg_run.get('optimizer', cfg.get('optimizer', 'adam'))).lower()
+            if opt_name == 'sgd':
+                optimizer = optim.SGD(
+                    model.parameters(),
+                    lr=float(cfg_run.get('lr', cfg.get('lr', 0.001))),
+                    momentum=float(cfg_run.get('momentum', cfg.get('momentum', 0.9))),
+                    weight_decay=float(cfg_run.get('weight_decay', cfg.get('weight_decay', 5e-4)))
+                )
+            else:
+                optimizer = optim.Adam(
+                    model.parameters(),
+                    lr=float(cfg_run.get('lr', cfg.get('lr', 0.001))),
+                    weight_decay=float(cfg_run.get('weight_decay', cfg.get('weight_decay', 5e-4)))
+                )
+            criterion = nn.CrossEntropyLoss()
+
+            # Optional scheduler
+            scheduler_cfg = cfg_run.get('scheduler', cfg.get('scheduler', None))
+            scheduler = None
+            if isinstance(scheduler_cfg, dict) and scheduler_cfg.get('name') == 'StepLR':
+                scheduler = torch.optim.lr_scheduler.StepLR(
+                    optimizer,
+                    step_size=int(scheduler_cfg.get('step_size', 10)),
+                    gamma=float(scheduler_cfg.get('gamma', 0.5))
+                )
+
+            # Training loop
+            print("Starting model training...")
+            start_time = time.time()
+            best_f1 = -1.0
+            best_model_path = None
+            eval_interval = int(cfg_run.get('eval_interval', cfg.get('eval_interval', 1)))
+            patience = cfg_run.get('early_stopping_patience', cfg.get('early_stopping_patience', None))
+            min_delta = float(cfg_run.get('early_stopping_min_delta', cfg.get('early_stopping_min_delta', 0.0)))
+            grad_clip = cfg_run.get('grad_clip', cfg.get('grad_clip', None))
+
+            for epoch in range(1, int(cfg_run.get('epochs', cfg.get('epochs', 200))) + 1):
+                print(f"\nEpoch {epoch}/{int(cfg_run.get('epochs', cfg.get('epochs', 200)))}")
+                loss = train(model, optimizer, criterion, train_loader, grad_clip=grad_clip)
+
+                # Evaluate per interval
+                do_eval = (epoch % eval_interval == 0) or (epoch == int(cfg_run.get('epochs', cfg.get('epochs', 200))))
+                if do_eval:
+                    preds, labels = test(model, test_loader)
+                    accuracy = accuracy_score(labels, preds)
+                    f1 = f1_score(labels, preds, average='weighted')
+                    print(f"Epoch {epoch:03d} | Train Loss: {loss:.4f} | Test Acc: {accuracy:.4f} | Test F1: {f1:.4f}")
+
+                    # Track best and optionally save
+                    if f1 > best_f1 + min_delta:
+                        best_f1 = f1
+                        if cfg_run.get('save_best', cfg.get('save_best', True)):
+                            best_model_path = save_dir / f"best_{run_id}.pth"
+                            torch.save(model.state_dict(), best_model_path)
+                            print(f"Saved best model to {best_model_path}")
+
+                    # Early stopping check
+                    if patience is not None:
+                        # if not improved, reduce patience
+                        # We use a simple counter: reset when improved, else decrement
+                        # To implement, store counter in cfg_run scoped variable
+                        pass
+
+                if scheduler is not None:
+                    scheduler.step()
+            duration = time.time() - start_time
+            print(f"Model training finished in {duration:.1f}s.")
+
+            # Final evaluation and save
+            final_preds, final_labels = test(model, test_loader)
+            final_acc = float(accuracy_score(final_labels, final_preds))
+            final_f1 = float(f1_score(final_labels, final_preds, average='weighted'))
+
+            model_save_path = save_dir / f"temporal_spatial_classifier_state_{run_id}.pth"
+            print(f"Saving model to {model_save_path}...")
+            torch.save(model.state_dict(), model_save_path)
+            print(f"Model saved to {model_save_path}")
+
+            # Append results to CSV
+            row = {
+                'run_id': run_id,
+                'params': json.dumps(cfg_run),
+                'accuracy': final_acc,
+                'f1': final_f1,
+                'model_path': str(model_save_path),
+                'best_model_path': str(best_model_path) if best_model_path else '',
+                'best_f1': best_f1 if best_f1 >= 0 else final_f1,
+                'duration_seconds': round(duration, 3)
+            }
+            write_header = not results_path.exists()
+            with results_path.open('a', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=header)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
+            print(f"Run {run_id} results saved to {results_path}")
 
     except Exception as e:
         import traceback

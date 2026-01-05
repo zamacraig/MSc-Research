@@ -1,0 +1,11 @@
+{
+    "epochs": [20, 40],
+    "lr": [0.001, 0.0005],
+    "weight_decay": [0.001, 0.0005],
+    "hidden_channels": [16, 32],
+    "in_channels": 8,
+    "num_classes": 5,
+    "train_ratio": 0.8,
+    "seed": 42,
+    "device": null
+}
