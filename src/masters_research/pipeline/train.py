@@ -35,7 +35,24 @@ from masters_research.data import create_graph_data
 from masters_research.data import TemporalDataLoader
 from masters_research.pipeline.dataset import create_temporal_dataset
 from masters_research.models import TemporalSpatialNodeClassifier
+from masters_research.pipeline.temporal_quality import run_temporal_quality_audit, compare_splits
 import seaborn as sns
+
+
+class FocalLoss(nn.Module):
+    """Multi-class Focal Loss: down-weights easy examples so the model focuses on hard ones.
+    Useful when temporal distribution shift causes the test classes to differ from training.
+    gamma=0 reduces to standard cross-entropy.
+    """
+    def __init__(self, gamma: float = 2.0, weight: torch.Tensor | None = None):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = nn.functional.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
+        pt = torch.exp(-ce)
+        return (((1.0 - pt) ** self.gamma) * ce).mean()
 
 
 def load_config(config_path: Path) -> dict:
@@ -95,6 +112,38 @@ def generate_param_grid(cfg_in: dict):
         grids.append(c)
     return grids
 
+
+def _print_class_balance_for_dataset(name: str, dataset, num_classes: int):
+    """Print simple class counts and percentages over all snapshots in a dataset."""
+    all_labels = []
+
+    n = getattr(dataset, "snapshot_count", None) or len(dataset)
+    for i in range(n):
+        y = dataset[i].y
+        if isinstance(y, torch.Tensor):
+            y = y.cpu().numpy()
+        y = np.asarray(y)
+        if y.size:
+            all_labels.append(y.astype(int))
+
+    if not all_labels:
+        print(f"No labels found for {name}; skipping class balance.")
+        return
+
+    labels = np.concatenate(all_labels, axis=0)
+    counts = np.bincount(labels, minlength=num_classes)
+    total = labels.size
+
+    print("\n" + "=" * 50)
+    print(f"CLASS BALANCE - {name}")
+    print("=" * 50)
+    print(f"Total labeled samples: {total}")
+    for cls in range(num_classes):
+        count = int(counts[cls])
+        pct = (100.0 * count / total) if total > 0 else 0.0
+        print(f"Class {cls}: {count} samples ({pct:.2f}%)")
+    print("=" * 50)
+
 def _save_confusion_matrix(cm: np.ndarray, classes: list, out_path: Path):
     plt.figure(figsize=(6, 5))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=classes, yticklabels=classes)
@@ -148,7 +197,7 @@ def _save_roc_curves(y_true: np.ndarray, y_prob: np.ndarray, classes: list, out_
         ax.legend()
         plt_ind.tight_layout()
         plt_ind.savefig(ind_path)
-        plt_ind.close()
+        plt.close(plt_ind)
     plt.plot([0,1],[0,1],'k--', alpha=0.4)
     plt.xlabel('False Positive Rate')
     plt.ylabel('True Positive Rate')
@@ -227,13 +276,16 @@ def _generate_summary_plots(results_csv: Path, plots_dir: Path):
         print(f"Failed to read results CSV: {e}")
         return
 
+    # Support both old ('f1') and new ('val_f1') column names
+    f1_col = 'val_f1' if 'val_f1' in df.columns else 'f1'
+
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) Bar plot of final F1 by run_id
     try:
         plt.figure(figsize=(12, 6))
-        order = df.sort_values('f1', ascending=False)['run_id'] if 'run_id' in df else None
-        sns.barplot(data=df, x='run_id', y='f1', order=order)
+        order = df.sort_values(f1_col, ascending=False)['run_id'] if 'run_id' in df else None
+        sns.barplot(data=df, x='run_id', y=f1_col, order=order)
         plt.xticks(rotation=45, ha='right')
         plt.title('Final F1 by Run')
         plt.tight_layout()
@@ -257,7 +309,7 @@ def _generate_summary_plots(results_csv: Path, plots_dir: Path):
                 # Ensure scalar values (not lists)
                 merged['lr'] = merged['lr'].apply(lambda v: v[0] if isinstance(v, list) and len(v) > 0 else v)
                 merged['hidden_channels'] = merged['hidden_channels'].apply(lambda v: v[0] if isinstance(v, list) and len(v) > 0 else v)
-                pivot = merged.pivot_table(index='hidden_channels', columns='lr', values='f1', aggfunc='max')
+                pivot = merged.pivot_table(index='hidden_channels', columns='lr', values=f1_col, aggfunc='max')
                 if pivot.size > 0:
                     plt.figure(figsize=(8, 6))
                     sns.heatmap(pivot, annot=True, fmt='.3f', cmap='viridis')
@@ -330,35 +382,54 @@ def main(base_path: Path):
         header = [
             "run_id",
             "params",
-            "accuracy",
-            "f1",
+            "val_accuracy",
+            "val_f1",
+            "final_test_accuracy",
+            "final_test_f1",
             "model_path",
             "best_model_path",
             "best_f1",
             "duration_seconds",
         ]
 
-        # Load data once (heavy operations)
-        print("Loading and preprocessing data...")
-        attribute_df, node_df = load_and_preprocess_data(base_path=str(base_path))
-        print("Data loading and preprocessing complete.")
+        # Resolve processed data cache path
+        default_processed = base_path / "Dataset" / "TransientData" / "processedData.csv"
+        processed_data_path = Path(cfg.get("processed_data_path", default_processed))
+        processed_data_path = processed_data_path if processed_data_path.is_absolute() else (base_path / processed_data_path)
 
-        # Filter timestamps based on missing nodes
-        print("\nFiltering timestamps...")
-        all_node_ids = set(node_df["ComputerNo"].unique())
-        nodes_per_timestamp = attribute_df.groupby("TimeStamp")["Compno"].nunique()
-        total_nodes = len(all_node_ids)
-        timestamps_to_keep = nodes_per_timestamp[total_nodes - nodes_per_timestamp <= 2].index
-        original_timestamp_count = len(attribute_df["TimeStamp"].unique())
-        attribute_df = attribute_df[attribute_df["TimeStamp"].isin(timestamps_to_keep)]
-        filtered_timestamp_count = len(attribute_df["TimeStamp"].unique())
-        print(f"Filtered timestamps from {original_timestamp_count} to {filtered_timestamp_count}.")
-        print(f"Keeping timestamps with {total_nodes - 2} or more nodes.")
+        if processed_data_path.exists():
+            # Fast path: load cached preprocessed data
+            print(f"Loading preprocessed data from {processed_data_path}...")
+            final_df = pd.read_csv(processed_data_path)
+            print("Preprocessed data loaded.")
+        else:
+            # Full preprocessing pipeline
+            print("Loading and preprocessing data...")
+            attribute_df, node_df = load_and_preprocess_data(base_path=str(base_path))
+            print("Data loading and preprocessing complete.")
 
-        print("\nCreating graph data...")
-        data_path = cfg.get("data_path", str(base_path / "Dataset" / "TransientData" / "corrected1_df.csv"))
-        final_df = pd.read_csv(data_path)
-        print("Graph data creation complete.")
+            # Filter timestamps based on missing nodes
+            print("\nFiltering timestamps...")
+            all_node_ids = set(node_df["ComputerNo"].unique())
+            nodes_per_timestamp = attribute_df.groupby("TimeStamp")["Compno"].nunique()
+            total_nodes = len(all_node_ids)
+            timestamps_to_keep = nodes_per_timestamp[total_nodes - nodes_per_timestamp <= 2].index
+            original_timestamp_count = len(attribute_df["TimeStamp"].unique())
+            attribute_df = attribute_df[attribute_df["TimeStamp"].isin(timestamps_to_keep)]
+            filtered_timestamp_count = len(attribute_df["TimeStamp"].unique())
+            print(f"Filtered timestamps from {original_timestamp_count} to {filtered_timestamp_count}.")
+            print(f"Keeping timestamps with {total_nodes - 2} or more nodes.")
+
+            print("\nLoading graph data...")
+            _data_path = cfg.get("data_path", str(base_path / "Dataset" / "TransientData" / "processedData.csv"))#"corrected1_df.csv"))
+            data_path = Path(_data_path) if Path(_data_path).is_absolute() else (base_path / _data_path)
+            final_df = pd.read_csv(data_path)
+            print("Graph data loaded.")
+
+            # Save for future runs
+            processed_data_path.parent.mkdir(parents=True, exist_ok=True)
+            final_df.to_csv(processed_data_path, index=False)
+            print(f"Preprocessed data saved to {processed_data_path}.")
 
         # Plot nodes per timestamp
         if cfg.get("plot_nodes_per_timestamp", True):
@@ -375,12 +446,52 @@ def main(base_path: Path):
             plt.savefig(plot_path)
             print(f"Plot saved to {plot_path}\n")
 
+        # Temporal data quality audit (run once, before any modelling)
+        if cfg.get("temporal_quality_audit", True):
+            run_temporal_quality_audit(
+                final_df,
+                plots_dir=plots_dir,
+                target_col="Target_x",
+                node_col="Compno_x",
+            )
+
         # Create dataset
         dataset = create_temporal_dataset(final_df)
         print("\n" + "=" * 50)
         print(" " * 18 + "DATASET INFO")
         print("=" * 50)
         print(dataset)
+
+        # Overall class balance before any splitting
+        _nc = cfg.get("num_classes", 5)
+        overall_num_classes = int(_nc[0] if isinstance(_nc, list) else _nc)
+        _print_class_balance_for_dataset("Full dataset (before any split)", dataset, num_classes=overall_num_classes)
+
+        # --- Outer hold-out split (done once, before grid search) ---
+        # final_test_dataset is never used during training or hyperparameter selection.
+        test_holdout_ratio = float(cfg.get("test_holdout_ratio", 0.2))
+        outer_train_ratio = 1.0 - test_holdout_ratio
+        print(f"\nOuter hold-out split: {outer_train_ratio:.0%} train+val / {test_holdout_ratio:.0%} final test...")
+        if bool(cfg.get("stratified_split", False)):
+            from masters_research.pipeline.dataset import stratified_temporal_signal_split
+            trainval_dataset, final_test_dataset = stratified_temporal_signal_split(
+                dataset, train_ratio=outer_train_ratio, num_classes=overall_num_classes
+            )
+        else:
+            trainval_dataset, final_test_dataset = temporal_signal_split(dataset, train_ratio=outer_train_ratio)
+        _print_class_balance_for_dataset("Train+Val pool (grid search)", trainval_dataset, num_classes=overall_num_classes)
+        _print_class_balance_for_dataset("Final held-out test set", final_test_dataset, num_classes=overall_num_classes)
+        if cfg.get("temporal_quality_audit", True):
+            compare_splits(
+                trainval_dataset,
+                final_test_dataset,
+                name_a="TrainVal pool",
+                name_b="Final test",
+                num_classes=overall_num_classes,
+                plots_dir=plots_dir,
+                plot_prefix="outer_split",
+            )
+        final_test_loader = TemporalDataLoader(final_test_dataset)
 
         # Run grid of experiments
         for run_idx, cfg_run in enumerate(grid, start=1):
@@ -398,24 +509,42 @@ def main(base_path: Path):
             torch.manual_seed(seed)
             np.random.seed(seed)
 
-            # Split dataset according to this run's train ratio
-            print("\nSplitting dataset into training and testing sets...")
+            # Resolve num_classes for this run
+            _nc_run = cfg_run.get("num_classes", cfg.get("num_classes", 5))
+            num_classes_run = int(_nc_run[0] if isinstance(_nc_run, list) else _nc_run)
+
+            # Inner split of train+val pool for this grid run (final_test_dataset is never touched here)
+            print("\nSplitting train+val pool into train / validation sets for this run...")
             train_ratio_val = cfg_run.get("train_ratio", cfg.get("train_ratio", 0.8))
             if bool(cfg_run.get("stratified_split", cfg.get("stratified_split", False))):
                 from masters_research.pipeline.dataset import stratified_temporal_signal_split
-                train_dataset, test_dataset = stratified_temporal_signal_split(
-                    dataset,
+                train_dataset, val_dataset = stratified_temporal_signal_split(
+                    trainval_dataset,
                     train_ratio=float(train_ratio_val),
-                    num_classes=int(cfg_run.get("num_classes", cfg.get("num_classes", 5))),
+                    num_classes=num_classes_run,
                 )
             else:
-                train_dataset, test_dataset = temporal_signal_split(
-                    dataset, train_ratio=train_ratio_val
+                train_dataset, val_dataset = temporal_signal_split(
+                    trainval_dataset, train_ratio=train_ratio_val
                 )
             print("Dataset splitting complete.")
 
+            # Class balance after splitting (per run)
+            _print_class_balance_for_dataset(f"Train set ({run_id})", train_dataset, num_classes=num_classes_run)
+            _print_class_balance_for_dataset(f"Val set ({run_id})", val_dataset, num_classes=num_classes_run)
+            if cfg_run.get("temporal_quality_audit", cfg.get("temporal_quality_audit", True)):
+                compare_splits(
+                    train_dataset,
+                    val_dataset,
+                    name_a=f"Train ({run_id})",
+                    name_b=f"Val ({run_id})",
+                    num_classes=num_classes_run,
+                    plots_dir=plots_dir,
+                    plot_prefix=f"inner_split_{run_id}",
+                )
+
             train_loader = TemporalDataLoader(train_dataset)
-            test_loader = TemporalDataLoader(test_dataset)
+            val_loader = TemporalDataLoader(val_dataset)
 
             # Device selection
             cfg_device = cfg_run.get("device", cfg.get("device", None))
@@ -471,17 +600,47 @@ def main(base_path: Path):
                     lr=float(cfg_run.get("lr", cfg.get("lr", 0.001))),
                     weight_decay=float(cfg_run.get("weight_decay", cfg.get("weight_decay", 5e-4))),
                 )
-            criterion = nn.CrossEntropyLoss()
+            # Class-weighted loss: inverse-frequency weights from training snapshots
+            _train_lbls = np.concatenate([
+                train_dataset[i].y.cpu().numpy().astype(int)
+                for i in range(getattr(train_dataset, "snapshot_count", None) or len(train_dataset))
+            ])
+            _counts = np.bincount(_train_lbls, minlength=num_classes_run).astype(float)
+            _w = 1.0 / np.maximum(_counts, 1)
+            _w = (_w / _w.sum()) * num_classes_run   # normalize so weights sum to num_classes
+            class_weights = torch.tensor(_w, dtype=torch.float).to(device)
+            print(f"Class weights: {[f'{v:.3f}' for v in _w]}")
+
+            # Loss function: Focal Loss (default, gamma=2) or plain weighted CE
+            use_focal = bool(cfg_run.get("focal_loss", cfg.get("focal_loss", True)))
+            focal_gamma = float(cfg_run.get("focal_gamma", cfg.get("focal_gamma", 2.0)))
+            if use_focal:
+                criterion = FocalLoss(gamma=focal_gamma, weight=class_weights)
+                print(f"Using Focal Loss (gamma={focal_gamma})")
+            else:
+                criterion = nn.CrossEntropyLoss(weight=class_weights)
+                print("Using weighted CrossEntropyLoss")
 
             # Optional scheduler
             scheduler_cfg = cfg_run.get("scheduler", cfg.get("scheduler", None))
             scheduler = None
-            if isinstance(scheduler_cfg, dict) and scheduler_cfg.get("name") == "StepLR":
-                scheduler = torch.optim.lr_scheduler.StepLR(
-                    optimizer,
-                    step_size=int(scheduler_cfg.get("step_size", 10)),
-                    gamma=float(scheduler_cfg.get("gamma", 0.5)),
-                )
+            if isinstance(scheduler_cfg, dict):
+                _sname = scheduler_cfg.get("name", "")
+                if _sname == "StepLR":
+                    scheduler = torch.optim.lr_scheduler.StepLR(
+                        optimizer,
+                        step_size=int(scheduler_cfg.get("step_size", 10)),
+                        gamma=float(scheduler_cfg.get("gamma", 0.5)),
+                    )
+                elif _sname == "ReduceLROnPlateau":
+                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                        optimizer,
+                        mode="max",
+                        factor=float(scheduler_cfg.get("factor", 0.5)),
+                        patience=int(scheduler_cfg.get("patience", 10)),
+                        min_lr=float(scheduler_cfg.get("min_lr", 1e-6)),
+                    )
+                    print(f"Using ReduceLROnPlateau scheduler (factor={scheduler_cfg.get('factor', 0.5)}, patience={scheduler_cfg.get('patience', 10)})")
 
             # Training loop
             print("Starting model training...")
@@ -490,7 +649,10 @@ def main(base_path: Path):
             best_model_path = None
             eval_interval = int(cfg_run.get("eval_interval", cfg.get("eval_interval", 1)))
             min_delta = float(cfg_run.get("early_stopping_min_delta", cfg.get("early_stopping_min_delta", 0.0)))
+            patience = int(cfg_run.get("early_stopping_patience", cfg.get("early_stopping_patience", 0)))
+            patience_counter = 0
             grad_clip = cfg_run.get("grad_clip", cfg.get("grad_clip", None))
+            last_val_f1 = -1.0
 
             for epoch in range(1, int(cfg_run.get("epochs", cfg.get("epochs", 200))) + 1):
                 print(f"\nEpoch {epoch}/{int(cfg_run.get('epochs', cfg.get('epochs', 200)))}")
@@ -501,31 +663,55 @@ def main(base_path: Path):
                     epoch == int(cfg_run.get("epochs", cfg.get("epochs", 200)))
                 )
                 if do_eval:
-                    preds, labels, probs = test_model(model, test_loader)
+                    preds, labels, probs = test_model(model, val_loader)
                     accuracy = accuracy_score(labels, preds)
                     f1 = f1_score(labels, preds, average="weighted")
                     print(
-                        f"Epoch {epoch:03d} | Train Loss: {loss:.4f} | Test Acc: {accuracy:.4f} | Test F1: {f1:.4f}"
+                        f"Epoch {epoch:03d} | Train Loss: {loss:.4f} | Val Acc: {accuracy:.4f} | Val F1: {f1:.4f}"
                     )
+
+                    last_val_f1 = f1
 
                     # Track best and optionally save
                     if f1 > best_f1 + min_delta:
                         best_f1 = f1
+                        patience_counter = 0
                         if cfg_run.get("save_best", cfg.get("save_best", True)):
                             best_model_path = save_dir / f"best_{run_id}.pth"
                             torch.save(model.state_dict(), best_model_path)
                             print(f"Saved best model to {best_model_path}")
+                    else:
+                        patience_counter += 1
+                        if patience > 0 and patience_counter >= patience:
+                            print(f"Early stopping: no improvement for {patience} eval steps (best Val F1: {best_f1:.4f}).")
+                            break
 
                 if scheduler is not None:
-                    scheduler.step()
+                    if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        if last_val_f1 >= 0:
+                            scheduler.step(last_val_f1)
+                    else:
+                        scheduler.step()
 
             duration = time.time() - start_time
             print(f"Model training finished in {duration:.1f}s.")
 
-            # Final evaluation and save
-            final_preds, final_labels, final_probs = test_model(model, test_loader)
+            # Reload best checkpoint before final evaluation
+            if best_model_path and Path(best_model_path).exists():
+                print(f"Reloading best checkpoint ({best_model_path.name}) for final evaluation...")
+                model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
+
+            # Final evaluation on validation set (used for grid search ranking)
+            final_preds, final_labels, final_probs = test_model(model, val_loader)
             final_acc = float(accuracy_score(final_labels, final_preds))
             final_f1 = float(f1_score(final_labels, final_preds, average="weighted"))
+
+            # Held-out final test evaluation (informational only; no decisions made here)
+            print("Evaluating on held-out final test set...")
+            ht_preds, ht_labels, ht_probs = test_model(model, final_test_loader)
+            ht_acc = float(accuracy_score(ht_labels, ht_preds))
+            ht_f1 = float(f1_score(ht_labels, ht_preds, average="weighted"))
+            print(f"Final test set  | Acc: {ht_acc:.4f} | F1: {ht_f1:.4f}")
 
             model_save_path = save_dir / f"temporal_spatial_classifier_state_{run_id}.pth"
             print(f"Saving model to {model_save_path}...")
@@ -536,8 +722,10 @@ def main(base_path: Path):
             row = {
                 "run_id": run_id,
                 "params": json.dumps(cfg_run),
-                "accuracy": final_acc,
-                "f1": final_f1,
+                "val_accuracy": final_acc,
+                "val_f1": final_f1,
+                "final_test_accuracy": ht_acc,
+                "final_test_f1": ht_f1,
                 "model_path": str(model_save_path),
                 "best_model_path": str(best_model_path) if best_model_path else "",
                 "best_f1": best_f1 if best_f1 >= 0 else final_f1,
@@ -567,9 +755,9 @@ def main(base_path: Path):
             # === Explainability: GNNExplainer (local subgraph) ===
             if bool(cfg_run.get("enable_explainability", cfg.get("enable_explainability", True))) and Explainer is not None and GNNExplainer is not None and ModelConfig is not None:
                 print("Generating GNNExplainer local explanations...")
-                # Take first snapshot from test_dataset
+                # Take first snapshot from val_dataset (held-out test set is not used for explainability)
                 try:
-                    test_snapshot = test_dataset[0]
+                    test_snapshot = val_dataset[0]
                     num_nodes = test_snapshot.x.shape[0]
                     # Feature names for readability in plots (must match dataset feature order)
                     feature_names = [
@@ -656,7 +844,7 @@ def main(base_path: Path):
             if bool(cfg_run.get("enable_explainability", cfg.get("enable_explainability", True))) and IntegratedGradients is not None:
                 print("Computing Integrated Gradients on node features...")
                 try:
-                    test_snapshot = test_dataset[0]
+                    test_snapshot = val_dataset[0]
                     # Feature names for readability in plots (must match dataset feature order)
                     feature_names = [
                         "AverageMaximumTemperature_x",

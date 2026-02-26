@@ -39,9 +39,30 @@ def create_temporal_dataset(final_df: pd.DataFrame) -> DynamicGraphTemporalSigna
     final_df[features_to_scale] = scaler.fit_transform(final_df[features_to_scale])
     print("Feature scaling complete.")
 
-    # Discretize target variable
-    final_df["Target_x"] = pd.qcut(final_df["Target_x"], q=5, labels=False, duplicates="drop")
-    print("Target discretization complete.")
+    # Discretize target variable into 5 classes.
+    # pd.qcut is tried first (equal-frequency); if duplicate bin edges reduce the
+    # number of unique classes below 5, pd.cut (equal-width) is used as a fallback
+    # so that exactly 5 non-empty classes are always produced.
+    n_classes = 5
+    raw_bins = pd.qcut(final_df["Target_x"], q=n_classes, labels=False, duplicates="drop")
+    actual_classes = raw_bins.nunique()
+    if actual_classes < n_classes:
+        print(
+            f"  WARNING: pd.qcut produced only {actual_classes} bins (duplicate bin edges). "
+            f"Falling back to equal-width pd.cut to guarantee {n_classes} classes."
+        )
+        raw_bins = pd.cut(final_df["Target_x"], bins=n_classes, labels=False)
+
+    # Relabel to consecutive integers 0..k-1 (guards against any gaps left by either method)
+    label_map = {old: new for new, old in enumerate(sorted(raw_bins.dropna().unique()))}
+    final_df["Target_x"] = raw_bins.map(label_map)
+
+    # Report the resulting distribution
+    dist = final_df["Target_x"].value_counts().sort_index()
+    total = dist.sum()
+    print("Target discretization complete. Distribution:")
+    for cls, cnt in dist.items():
+        print(f"  Class {int(cls)}: {cnt} samples ({100.0 * cnt / total:.1f}%)")
 
     # Timestamps
     timestamps = final_df["TimeStamp"].unique()

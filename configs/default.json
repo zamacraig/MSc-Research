@@ -1,19 +1,29 @@
 {
   "epochs": [300],
-  "lr": [0.0005, 0.0001],
-  "weight_decay": [0.001, 0.01],
+  "lr": [0.001, 0.0005],
+  "weight_decay": [0.0005, 0.001],
   "hidden_channels": [32, 64],
   "in_channels": 8,
   "num_classes": [5],
   "train_ratio": 0.8,
+  "test_holdout_ratio": 0.2,
   "seed": [32, 42],
   "device": "cpu",
-  "optimizer": "sgd",
+  "optimizer": "adam",
+  "scheduler": {
+    "name": "ReduceLROnPlateau",
+    "factor": 0.5,
+    "patience": 15,
+    "min_lr": 1e-6
+  },
+  "early_stopping_patience": 40,
+  "early_stopping_min_delta": 0.001,
   "save_best": true,
   "eval_interval": 1,
   "plot_nodes_per_timestamp": true,
   "run_name": "run",
   "data_path": "Dataset/TransientData/corrected1_df.csv",
+  "processed_data_path": "Dataset/TransientData/processedData.csv",
   "save_dir": "src/masters_research/artifacts/models",
   "plots_dir": "src/masters_research/artifacts/plots",
   "enable_explainability": true,
@@ -23,5 +33,8 @@
   "ig_steps": 50,
   "use_attention": false,
   "gat_heads": 4,
-  "stratified_split": true
+  "stratified_split": true,
+  "temporal_quality_audit": true,
+  "focal_loss": true,
+  "focal_gamma": 2.0
 }
