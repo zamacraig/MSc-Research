@@ -1,0 +1,30 @@
+# Project requirements
+# Notes:
+# - This repo appears to be using Python 3.12. Some older packages (for example
+#   numpy 1.23.x or pandas 1.3.x) do not provide pre-built wheels for Python 3.12
+#   and pip will attempt to build from source which fails on Windows.
+# - Install PyTorch CPU wheel first using the PyTorch wheel index (see example
+#   command below). After torch is installed, install the rest of the requirements.
+#
+# Example (run from the project root, in cmd.exe):
+#   python -m pip install --upgrade pip setuptools wheel
+#   python -m pip install "torch==2.1.0+cpu" -f https://download.pytorch.org/whl/torch_stable.html
+#   python -m pip install -r requirements.txt
+#
+# Requested core versions (CPU builds where applicable)
+torch==2.2.0
+torch-geometric==2.6.1
+torch-geometric-temporal==0.54.0
+captum==0.7.0
+
+# Use versions compatible with Python 3.12 (pre-built wheels available)
+pandas==1.3.5
+numpy==1.26.4
+matplotlib==3.7.2
+seaborn==0.12.2
+networkx==3.1
+scikit-learn==1.3.2
+joblib==1.3.1
+scikeras==0.13.0
+
+# End of requirements

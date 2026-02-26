@@ -4,6 +4,7 @@ import pandas as pd
 from datetime import datetime
 from sklearn.preprocessing import MinMaxScaler, LabelEncoder
 from torch_geometric_temporal.signal import DynamicGraphTemporalSignalBatch
+import numpy as np
 
 
 def create_temporal_dataset(final_df: pd.DataFrame) -> DynamicGraphTemporalSignalBatch:
@@ -152,3 +153,69 @@ def create_temporal_dataset(final_df: pd.DataFrame) -> DynamicGraphTemporalSigna
         batches=all_batches,
         timestamps=timestamps_list,
     )
+
+
+def stratified_temporal_signal_split(dataset: DynamicGraphTemporalSignalBatch, train_ratio: float = 0.8, num_classes: int | None = None):
+    """
+    Split snapshots into train/test ensuring the test set covers all classes.
+
+    - Greedy selection adds snapshots that cover uncovered classes first.
+    - Fills remaining test slots from leftover snapshots.
+
+    Returns (train_dataset, test_dataset).
+    """
+    # Snapshot-level labels
+    snapshot_labels = []
+    for i in range(dataset.snapshot_count):
+        snap = dataset[i]
+        lbls = set(np.unique(snap.y.cpu().numpy()))
+        snapshot_labels.append(lbls)
+
+    # Infer number of classes if not provided
+    if num_classes is None:
+        all_classes = sorted(set().union(*snapshot_labels))
+        num_classes = int(max(all_classes) + 1) if all_classes else 1
+
+    total = dataset.snapshot_count
+    test_count = max(1, int(round(total * (1.0 - float(train_ratio)))) )
+
+    # Greedy cover of classes
+    uncovered = set(range(num_classes))
+    candidates = list(range(total))
+    test_idxs = []
+    while uncovered and len(test_idxs) < test_count and candidates:
+        # pick snapshot that covers most uncovered classes
+        best_i = None
+        best_gain = -1
+        for i in candidates:
+            gain = len(snapshot_labels[i] & uncovered)
+            if gain > best_gain:
+                best_gain = gain
+                best_i = i
+        if best_i is None:
+            break
+        test_idxs.append(best_i)
+        uncovered -= (snapshot_labels[best_i] & uncovered)
+        candidates.remove(best_i)
+
+    # Fill remaining test slots
+    for i in candidates:
+        if len(test_idxs) >= test_count:
+            break
+        test_idxs.append(i)
+
+    test_set = set(test_idxs)
+    train_idxs = [i for i in range(total) if i not in test_set]
+
+    # Construct new datasets by indexing
+    def subset(idxs):
+        return DynamicGraphTemporalSignalBatch(
+            edge_indices=[dataset.edge_indices[i] for i in idxs],
+            edge_weights=[dataset.edge_weights[i] for i in idxs],
+            features=[dataset.features[i] for i in idxs],
+            targets=[dataset.targets[i] for i in idxs],
+            batches=[dataset.batches[i] for i in idxs],
+            timestamps=[dataset.timestamps[i] for i in idxs],
+        )
+
+    return subset(train_idxs), subset(test_idxs)

@@ -15,6 +15,7 @@
 torch==2.2.0
 torch-geometric==2.6.1
 torch-geometric-temporal==0.54.0
+captum==0.7.0
 
 # Use versions compatible with Python 3.12 (pre-built wheels available)
 pandas==1.3.5
@@ -24,5 +25,6 @@ seaborn==0.12.2
 networkx==3.1
 scikit-learn==1.3.2
 joblib==1.3.1
+scikeras==0.13.0
 
 # End of requirements

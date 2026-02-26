@@ -19,6 +19,16 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import label_binarize
 from torch_geometric_temporal.signal import temporal_signal_split
+try:
+    from torch_geometric.explain import Explainer, GNNExplainer, ModelConfig
+except Exception:
+    Explainer = None
+    GNNExplainer = None
+    ModelConfig = None
+try:
+    from captum.attr import IntegratedGradients
+except Exception:
+    IntegratedGradients = None
 
 from masters_research.data import load_and_preprocess_data
 from masters_research.data import create_graph_data
@@ -378,6 +388,11 @@ def main(base_path: Path):
             run_id = f"{run_prefix}{run_idx}_{int(time.time())}"
             print(f"\n=== Starting grid run {run_idx}/{len(grid)} ({run_id}) ===")
 
+            # Print resolved hyperparameters for this run
+            print("Run configuration:")
+            for key in sorted(cfg_run.keys()):
+                print(f"  {key}: {cfg_run[key]}")
+
             # set per-run seed
             seed = int(cfg_run.get("seed", cfg.get("seed", 42)))
             torch.manual_seed(seed)
@@ -385,9 +400,18 @@ def main(base_path: Path):
 
             # Split dataset according to this run's train ratio
             print("\nSplitting dataset into training and testing sets...")
-            train_dataset, test_dataset = temporal_signal_split(
-                dataset, train_ratio=cfg_run.get("train_ratio", cfg.get("train_ratio", 0.8))
-            )
+            train_ratio_val = cfg_run.get("train_ratio", cfg.get("train_ratio", 0.8))
+            if bool(cfg_run.get("stratified_split", cfg.get("stratified_split", False))):
+                from masters_research.pipeline.dataset import stratified_temporal_signal_split
+                train_dataset, test_dataset = stratified_temporal_signal_split(
+                    dataset,
+                    train_ratio=float(train_ratio_val),
+                    num_classes=int(cfg_run.get("num_classes", cfg.get("num_classes", 5))),
+                )
+            else:
+                train_dataset, test_dataset = temporal_signal_split(
+                    dataset, train_ratio=train_ratio_val
+                )
             print("Dataset splitting complete.")
 
             train_loader = TemporalDataLoader(train_dataset)
@@ -404,11 +428,29 @@ def main(base_path: Path):
             print(f"\nUsing device: {device}")
 
             # Model
-            model = TemporalSpatialNodeClassifier(
-                in_channels=int(cfg_run.get("in_channels", cfg.get("in_channels", 8))),
-                hidden_channels=int(cfg_run.get("hidden_channels", cfg.get("hidden_channels", 16))),
-                num_classes=int(cfg_run.get("num_classes", cfg.get("num_classes", 5))),
-            ).to(device)
+            use_attention = bool(cfg_run.get("use_attention", cfg.get("use_attention", False)))
+            if use_attention:
+                try:
+                    from masters_research.models.temporal_spatial_attention import TemporalSpatialAttentionNodeClassifier
+                    model = TemporalSpatialAttentionNodeClassifier(
+                        in_channels=int(cfg_run.get("in_channels", cfg.get("in_channels", 8))),
+                        hidden_channels=int(cfg_run.get("hidden_channels", cfg.get("hidden_channels", 16))),
+                        num_classes=int(cfg_run.get("num_classes", cfg.get("num_classes", 5))),
+                        heads=int(cfg_run.get("gat_heads", cfg.get("gat_heads", 4)))
+                    ).to(device)
+                except Exception:
+                    print("Attention model unavailable; falling back to baseline GCN model.")
+                    model = TemporalSpatialNodeClassifier(
+                        in_channels=int(cfg_run.get("in_channels", cfg.get("in_channels", 8))),
+                        hidden_channels=int(cfg_run.get("hidden_channels", cfg.get("hidden_channels", 16))),
+                        num_classes=int(cfg_run.get("num_classes", cfg.get("num_classes", 5))),
+                    ).to(device)
+            else:
+                model = TemporalSpatialNodeClassifier(
+                    in_channels=int(cfg_run.get("in_channels", cfg.get("in_channels", 8))),
+                    hidden_channels=int(cfg_run.get("hidden_channels", cfg.get("hidden_channels", 16))),
+                    num_classes=int(cfg_run.get("num_classes", cfg.get("num_classes", 5))),
+                ).to(device)
             print("\n" + "=" * 50)
             print(" " * 15 + "MODEL ARCHITECTURE")
             print("=" * 50)
@@ -521,6 +563,168 @@ def main(base_path: Path):
                 save_dir=save_dir,
                 plots_dir=plots_dir,
             )
+
+            # === Explainability: GNNExplainer (local subgraph) ===
+            if bool(cfg_run.get("enable_explainability", cfg.get("enable_explainability", True))) and Explainer is not None and GNNExplainer is not None and ModelConfig is not None:
+                print("Generating GNNExplainer local explanations...")
+                # Take first snapshot from test_dataset
+                try:
+                    test_snapshot = test_dataset[0]
+                    num_nodes = test_snapshot.x.shape[0]
+                    # Feature names for readability in plots (must match dataset feature order)
+                    feature_names = [
+                        "AverageMaximumTemperature_x",
+                        "AverageMinimunTemperature_x",
+                        "AverageMaximumRelativeHumidity_x",
+                        "AverageMinimumRelativeHumidity_x",
+                        "TotalRainfall_x",
+                        "AverageTotalRadiation_x",
+                        "AverageWindSpeed_x",
+                        "AverageTotalRelativeEvaporation_x",
+                    ]
+                    # Determine edge weight tensor attribute name across library versions
+                    edge_weight_src = getattr(test_snapshot, 'edge_weight', None)
+                    if edge_weight_src is None:
+                        edge_weight_src = getattr(test_snapshot, 'edge_attr', None)
+                    # Choose up to N nodes
+                    explain_nodes = int(cfg_run.get("gnnexplainer_nodes", cfg.get("gnnexplainer_nodes", 5)))
+                    node_indices = list(range(min(explain_nodes, num_nodes)))
+                    explainer = Explainer(
+                        model=model,
+                        algorithm=GNNExplainer(epochs=int(cfg_run.get("gnnexplainer_epochs", cfg.get("gnnexplainer_epochs", 100)))),
+                        explanation_type='model',
+                        node_mask_type='attributes',
+                        edge_mask_type='object',
+                        # Use explicit multiclass classification mode to match torch_geometric 2.6.x
+                        model_config=ModelConfig(mode='multiclass_classification', task_level='node', return_type='log_probs')
+                    )
+                    for idx in node_indices:
+                        explanation = explainer(
+                            x=test_snapshot.x,
+                            edge_index=test_snapshot.edge_index,
+                            edge_weight=edge_weight_src,
+                            index=idx
+                        )
+                        # Prefer node feature mask; fall back if needed
+                        feat_mask = None
+                        if hasattr(explanation, 'node_feat_mask') and explanation.node_feat_mask is not None:
+                            feat_mask = explanation.node_feat_mask
+                        elif hasattr(explanation, 'feature_mask') and explanation.feature_mask is not None:
+                            feat_mask = explanation.feature_mask
+                        elif hasattr(explanation, 'node_mask') and explanation.node_mask is not None:
+                            # Some versions expose a generic node_mask; use it as last resort
+                            feat_mask = explanation.node_mask
+
+                        edge_mask = getattr(explanation, 'edge_mask', None)
+
+                        # Feature importance bar (only if mask available)
+                        if feat_mask is not None:
+                            mask_np = feat_mask.detach().cpu().numpy()
+                            # If mask is multi-dim, reduce to per-feature (e.g., mean across nodes)
+                            if mask_np.ndim > 1:
+                                mask_np = mask_np.mean(axis=0)
+                            plt.figure(figsize=(10,4))
+                            # Use feature names if available and lengths match
+                            x_labels = feature_names if len(feature_names) == len(mask_np) else list(range(len(mask_np)))
+                            sns.barplot(x=x_labels, y=mask_np)
+                            plt.xlabel('Feature')
+                            plt.ylabel('Importance')
+                            plt.title(f'GNNExplainer Feature Importance (node {idx})')
+                            if x_labels is feature_names:
+                                plt.xticks(rotation=45, ha='right')
+                            plt.tight_layout()
+                            out_path = plots_dir / f"{run_id}_gnnexplainer_node_{idx}_feature_importance.png"
+                            plt.savefig(out_path)
+                            plt.close()
+
+                        # Edge importance histogram
+                        if edge_mask is not None:
+                            edge_np = edge_mask.detach().cpu().numpy()
+                            plt.figure(figsize=(8,4))
+                            sns.histplot(edge_np, bins=20)
+                            plt.xlabel('Edge mask value')
+                            plt.ylabel('Count')
+                            plt.title(f'GNNExplainer Edge Mask Distribution (node {idx})')
+                            plt.tight_layout()
+                            out_path = plots_dir / f"{run_id}_gnnexplainer_node_{idx}_edge_mask_hist.png"
+                            plt.savefig(out_path)
+                            plt.close()
+                except Exception as e:
+                    print(f"GNNExplainer generation failed: {e}")
+
+            # === Explainability: Captum Integrated Gradients ===
+            if bool(cfg_run.get("enable_explainability", cfg.get("enable_explainability", True))) and IntegratedGradients is not None:
+                print("Computing Integrated Gradients on node features...")
+                try:
+                    test_snapshot = test_dataset[0]
+                    # Feature names for readability in plots (must match dataset feature order)
+                    feature_names = [
+                        "AverageMaximumTemperature_x",
+                        "AverageMinimunTemperature_x",
+                        "AverageMaximumRelativeHumidity_x",
+                        "AverageMinimumRelativeHumidity_x",
+                        "TotalRainfall_x",
+                        "AverageTotalRadiation_x",
+                        "AverageWindSpeed_x",
+                        "AverageTotalRelativeEvaporation_x",
+                    ]
+                    # Determine edge weight tensor attribute name across library versions
+                    edge_weight_src = getattr(test_snapshot, 'edge_weight', None)
+                    if edge_weight_src is None:
+                        edge_weight_src = getattr(test_snapshot, 'edge_attr', None)
+                    # Choose first K nodes for speed
+                    ig_nodes = int(cfg_run.get("ig_nodes", cfg.get("ig_nodes", 5)))
+                    node_indices = list(range(min(ig_nodes, test_snapshot.x.shape[0])))
+                    ig_steps = int(cfg_run.get("ig_steps", cfg.get("ig_steps", 50)))
+                    num_classes_cfg = int(cfg_run.get("num_classes", cfg.get("num_classes", 5)))
+
+                    # Compute IG for every class to ensure outputs exist for all classes
+                    per_class_attr = {c: [] for c in range(num_classes_cfg)}
+                    for idx in node_indices:
+                        def forward_node(x):
+                            logits = model(x, test_snapshot.edge_index, edge_weight_src)
+                            return logits[idx].unsqueeze(0)
+
+                        ig = IntegratedGradients(forward_node)
+                        for cls in range(num_classes_cfg):
+                            attributions = ig.attribute(
+                                inputs=test_snapshot.x.clone().detach().requires_grad_(True),
+                                target=cls,
+                                n_steps=ig_steps
+                            )
+                            attr_vec = attributions[idx].detach().cpu().numpy()
+                            per_class_attr[cls].append(attr_vec)
+
+                    # Aggregate per-class attributions
+                    for cls, vecs in per_class_attr.items():
+                        arr = np.stack(vecs, axis=0)
+                        mean_attr = arr.mean(axis=0)
+                        # Save bar
+                        plt.figure(figsize=(10,4))
+                        x_labels = feature_names if len(feature_names) == mean_attr.shape[0] else list(range(mean_attr.shape[0]))
+                        sns.barplot(x=x_labels, y=mean_attr)
+                        plt.xlabel('Feature')
+                        plt.ylabel('IG Attribution (mean)')
+                        plt.title(f'Integrated Gradients (class {cls})')
+                        if x_labels is feature_names:
+                            plt.xticks(rotation=45, ha='right')
+                        plt.tight_layout()
+                        out_path = plots_dir / f"{run_id}_ig_class_{cls}_mean_attr.png"
+                        plt.savefig(out_path)
+                        plt.close()
+
+                        # Save whisker plot across nodes
+                        plt.figure(figsize=(6,4))
+                        sns.boxplot(data=arr)
+                        plt.xlabel('Feature')
+                        plt.ylabel('IG Attribution')
+                        plt.title(f'IG Distribution Across Nodes (class {cls})')
+                        plt.tight_layout()
+                        out_path = plots_dir / f"{run_id}_ig_class_{cls}_box.png"
+                        plt.savefig(out_path)
+                        plt.close()
+                except Exception as e:
+                    print(f"Integrated Gradients failed: {e}")
 
         # After all runs, generate summary plots
         _generate_summary_plots(results_path, plots_dir)

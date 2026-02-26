@@ -1,2 +1,0 @@
-run_id,split,accuracy,f1_weighted,f1_macro,roc_auc_macro_ovr
-run1_1767651914,test,0.7931034482758621,0.7767679742068908,0.7503265670446171,
