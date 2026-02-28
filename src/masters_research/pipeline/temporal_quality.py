@@ -527,7 +527,7 @@ def run_temporal_quality_audit(
 
     Parameters
     ----------
-    df          : The preprocessed dataframe (corrected1_df / processedData).
+    df          : The preprocessed dataframe (processedData.csv).
                   Target_x should already be discretised into integer classes.
     plots_dir   : If provided, saves diagnostic plots there.
     weights     : Per-dimension score weights. Defaults to equal weighting.

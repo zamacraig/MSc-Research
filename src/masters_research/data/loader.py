@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import os
 from pathlib import Path
+from sklearn.preprocessing import MinMaxScaler
 
 
 def load_and_preprocess_data(base_path: str = "."):
@@ -83,9 +84,24 @@ def load_and_preprocess_data(base_path: str = "."):
         ["ComputerNo", "Latitude", "Longitude", "Altitude"]
     ].apply(pd.to_numeric, errors="coerce")
 
-    # Calculate target column
-    print("[5/8] Calculating target column...")
-    attribute_df["Target"] = attribute_df.drop(["Compno", "Year", "Month"], axis=1).mean(axis=1)
+    # Normalize feature columns before computing the target so that every feature
+    # contributes equally to the composite mean (not dominated by high-magnitude
+    # columns such as Humidity or Rainfall).
+    print("[5/8] Normalizing feature columns (MinMaxScaler) and calculating target column...")
+    feature_cols = [
+        "AverageMaximumTemperature",
+        "AverageMinimunTemperature",
+        "AverageMaximumRelativeHumidity",
+        "AverageMinimumRelativeHumidity",
+        "TotalRainfall",
+        "AverageTotalRadiation",
+        "AverageWindSpeed",
+        "AverageTotalRelativeEvaporation",
+    ]
+    scaler = MinMaxScaler()
+    attribute_df[feature_cols] = scaler.fit_transform(attribute_df[feature_cols])
+    # Target is the mean of the 8 normalized features — each contributes equally.
+    attribute_df["Target"] = attribute_df[feature_cols].mean(axis=1)
 
     # Fix null values
     print("[6/8] Handling null values (forward-fill for TotalRainfall)...")

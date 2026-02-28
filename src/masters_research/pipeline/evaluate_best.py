@@ -189,7 +189,7 @@ def main(base_path: Path | str) -> Path:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Data
-    data_path = merged.get("data_path", "Dataset/TransientData/corrected1_df.csv")
+    data_path = merged.get("data_path", "Dataset/TransientData/processedData.csv")
     data_path = base_path / data_path if not Path(data_path).is_absolute() else Path(data_path)
     final_df = pd.read_csv(data_path)
     dataset = create_temporal_dataset(final_df)

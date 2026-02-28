@@ -30,8 +30,6 @@ try:
 except Exception:
     IntegratedGradients = None
 
-from masters_research.data import load_and_preprocess_data
-from masters_research.data import create_graph_data
 from masters_research.data import TemporalDataLoader
 from masters_research.pipeline.dataset import create_temporal_dataset
 from masters_research.models import TemporalSpatialNodeClassifier
@@ -55,6 +53,20 @@ class FocalLoss(nn.Module):
         return (((1.0 - pt) ** self.gamma) * ce).mean()
 
 
+class _ExplainWrapper(nn.Module):
+    """Thin wrapper used only for GNNExplainer / captum.
+    The GRU models now return (log_probs, hidden) tuples; this wrapper strips the
+    hidden state so external explainability tools receive a plain log-probability tensor.
+    """
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self._m = model
+
+    def forward(self, x, edge_index, edge_weight=None):
+        result = self._m(x, edge_index, edge_weight)
+        return result[0] if isinstance(result, tuple) else result
+
+
 def load_config(config_path: Path) -> dict:
     """Load JSON config and return dict."""
     cfg = {}
@@ -70,9 +82,16 @@ def train_epoch(model, optimizer, criterion, train_loader, grad_clip=None):
     model.train()
     total_loss = 0
     loader_len = len(list(train_loader))
+    hidden = None  # GRU hidden state carried across snapshots within the epoch
+    # Reset temporal attention history buffer at start of each epoch
+    if hasattr(model, "reset_history"):
+        model.reset_history()
     for snapshot in train_loader:
         optimizer.zero_grad()
-        out = model(snapshot.x, snapshot.edge_index, snapshot.edge_attr)
+        result = model(snapshot.x, snapshot.edge_index, snapshot.edge_attr, hidden=hidden)
+        out, hidden = result if isinstance(result, tuple) else (result, None)
+        if hidden is not None:
+            hidden = hidden.detach()  # truncated BPTT — don't backprop through prior snapshots
         targets_long = snapshot.y.clone().to(torch.long)
         loss = criterion(out, targets_long)
         loss.backward()
@@ -88,9 +107,14 @@ def test_model(model, loader):
     all_preds = []
     all_labels = []
     all_probs = []
+    hidden = None  # GRU hidden state carried across snapshots within the evaluation pass
+    # Reset temporal attention history buffer at start of evaluation
+    if hasattr(model, "reset_history"):
+        model.reset_history()
     with torch.no_grad():
         for snapshot in loader:
-            out = model(snapshot.x, snapshot.edge_index, snapshot.edge_attr)
+            result = model(snapshot.x, snapshot.edge_index, snapshot.edge_attr, hidden=hidden)
+            out, hidden = result if isinstance(result, tuple) else (result, None)
             preds = out.argmax(dim=1)
             probs = out.exp()  # since model outputs log_softmax
             all_preds.extend(preds.cpu().numpy())
@@ -355,6 +379,217 @@ def _generate_summary_plots(results_csv: Path, plots_dir: Path):
         print(f"Failed to generate per-class F1 boxplot across runs: {e}")
 
 
+def _train_one_fold(
+    fold_label: str,
+    train_dataset,
+    val_dataset,
+    cfg_run: dict,
+    cfg: dict,
+    device,
+    save_dir: Path,
+    num_classes_run: int,
+) -> dict:
+    """
+    Create a fresh model, run the training loop with early stopping, reload the best
+    checkpoint, evaluate on val_dataset, save model state, and return a results dict.
+
+    Returned dict keys:
+        model, best_model_path, model_save_path, best_f1,
+        val_acc, val_f1, val_preds, val_labels, val_probs, duration.
+    """
+    train_loader = TemporalDataLoader(train_dataset)
+    val_loader   = TemporalDataLoader(val_dataset)
+
+    # --- Model ---
+    use_attention = bool(cfg_run.get("use_attention", cfg.get("use_attention", False)))
+    use_temporal_attention = bool(cfg_run.get("use_temporal_attention", cfg.get("use_temporal_attention", False)))
+    _gru_layers   = int(cfg_run.get("gru_layers",    cfg.get("gru_layers",    1)))
+    _input_norm   = bool(cfg_run.get("input_norm",   cfg.get("input_norm",    True)))
+    _in_channels  = int(cfg_run.get("in_channels", cfg.get("in_channels", 10)))
+    _hidden_channels = int(cfg_run.get("hidden_channels", cfg.get("hidden_channels", 16)))
+    _dropout = float(cfg_run.get("dropout", cfg.get("dropout", 0.3)))
+    
+    if use_temporal_attention:
+        # New temporal attention model with history buffer
+        from masters_research.models.temporal_attention_gnn import TemporalAttentionGNN
+        _history_len = int(cfg_run.get("temporal_history_len", cfg.get("temporal_history_len", 10)))
+        _temporal_heads = int(cfg_run.get("temporal_heads", cfg.get("temporal_heads", 4)))
+        print(f"  [{fold_label}] Using TemporalAttentionGNN (history_len={_history_len}, heads={_temporal_heads}, dropout={_dropout})")
+        model = TemporalAttentionGNN(
+            in_channels=_in_channels,
+            hidden_channels=_hidden_channels,
+            num_classes=num_classes_run,
+            history_len=_history_len,
+            temporal_heads=_temporal_heads,
+            gru_layers=_gru_layers,
+            dropout=_dropout,
+            input_norm=_input_norm,
+            use_gat=use_attention,
+            gat_heads=int(cfg_run.get("gat_heads", cfg.get("gat_heads", 4))),
+        ).to(device)
+    elif use_attention:
+        try:
+            from masters_research.models.temporal_spatial_attention import TemporalSpatialAttentionNodeClassifier
+            model = TemporalSpatialAttentionNodeClassifier(
+                in_channels=_in_channels,
+                hidden_channels=_hidden_channels,
+                num_classes=num_classes_run,
+                heads=int(cfg_run.get("gat_heads", cfg.get("gat_heads", 4))),
+                gru_layers=_gru_layers,
+                dropout=_dropout,
+                input_norm=_input_norm,
+            ).to(device)
+        except Exception:
+            print(f"  [{fold_label}] Attention model unavailable; falling back to baseline GCN.")
+            model = TemporalSpatialNodeClassifier(
+                in_channels=_in_channels,
+                hidden_channels=_hidden_channels,
+                num_classes=num_classes_run,
+                gru_layers=_gru_layers,
+                dropout=_dropout,
+                input_norm=_input_norm,
+            ).to(device)
+    else:
+        model = TemporalSpatialNodeClassifier(
+            in_channels=_in_channels,
+            hidden_channels=_hidden_channels,
+            num_classes=num_classes_run,
+            gru_layers=_gru_layers,
+            dropout=_dropout,
+            input_norm=_input_norm,
+        ).to(device)
+
+    # --- Optimizer ---
+    opt_name = str(cfg_run.get("optimizer", cfg.get("optimizer", "adam"))).lower()
+    if opt_name == "sgd":
+        optimizer = optim.SGD(
+            model.parameters(),
+            lr=float(cfg_run.get("lr", cfg.get("lr", 0.001))),
+            momentum=float(cfg_run.get("momentum", cfg.get("momentum", 0.9))),
+            weight_decay=float(cfg_run.get("weight_decay", cfg.get("weight_decay", 5e-4))),
+        )
+    else:
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=float(cfg_run.get("lr", cfg.get("lr", 0.001))),
+            weight_decay=float(cfg_run.get("weight_decay", cfg.get("weight_decay", 5e-4))),
+        )
+
+    # --- Class weights (inverse-frequency from training snapshots) ---
+    _train_lbls = np.concatenate([
+        train_dataset[i].y.cpu().numpy().astype(int)
+        for i in range(getattr(train_dataset, "snapshot_count", None) or len(train_dataset))
+    ])
+    _counts = np.bincount(_train_lbls, minlength=num_classes_run).astype(float)
+    _w = 1.0 / np.maximum(_counts, 1)
+    _w = (_w / _w.sum()) * num_classes_run
+    class_weights = torch.tensor(_w, dtype=torch.float).to(device)
+    print(f"  [{fold_label}] Class weights: {[f'{v:.3f}' for v in _w]}")
+
+    # --- Loss function ---
+    use_focal   = bool(cfg_run.get("focal_loss",  cfg.get("focal_loss",  True)))
+    focal_gamma = float(cfg_run.get("focal_gamma", cfg.get("focal_gamma", 2.0)))
+    if use_focal:
+        criterion = FocalLoss(gamma=focal_gamma, weight=class_weights)
+        print(f"  [{fold_label}] Using Focal Loss (gamma={focal_gamma})")
+    else:
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        print(f"  [{fold_label}] Using weighted CrossEntropyLoss")
+
+    # --- Scheduler ---
+    scheduler_cfg = cfg_run.get("scheduler", cfg.get("scheduler", None))
+    scheduler = None
+    if isinstance(scheduler_cfg, dict):
+        _sname = scheduler_cfg.get("name", "")
+        if _sname == "StepLR":
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=int(scheduler_cfg.get("step_size", 10)),
+                gamma=float(scheduler_cfg.get("gamma", 0.5)),
+            )
+        elif _sname == "ReduceLROnPlateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="max",
+                factor=float(scheduler_cfg.get("factor", 0.5)),
+                patience=int(scheduler_cfg.get("patience", 10)),
+                min_lr=float(scheduler_cfg.get("min_lr", 1e-6)),
+            )
+            print(f"  [{fold_label}] ReduceLROnPlateau scheduler "
+                  f"(factor={scheduler_cfg.get('factor', 0.5)}, patience={scheduler_cfg.get('patience', 10)})")
+
+    # --- Training loop ---
+    print(f"  [{fold_label}] Starting training...")
+    start_time      = time.time()
+    best_f1         = -1.0
+    best_model_path = None
+    eval_interval   = int(cfg_run.get("eval_interval",         cfg.get("eval_interval",         1)))
+    min_delta       = float(cfg_run.get("early_stopping_min_delta", cfg.get("early_stopping_min_delta", 0.0)))
+    patience        = int(cfg_run.get("early_stopping_patience",    cfg.get("early_stopping_patience",    0)))
+    patience_counter = 0
+    grad_clip       = cfg_run.get("grad_clip", cfg.get("grad_clip", None))
+    last_val_f1     = -1.0
+    num_epochs      = int(cfg_run.get("epochs", cfg.get("epochs", 200)))
+
+    for epoch in range(1, num_epochs + 1):
+        loss = train_epoch(model, optimizer, criterion, train_loader, grad_clip=grad_clip)
+        do_eval = (epoch % eval_interval == 0) or (epoch == num_epochs)
+        if do_eval:
+            preds, labels, probs = test_model(model, val_loader)
+            acc = accuracy_score(labels, preds)
+            f1  = f1_score(labels, preds, average="weighted")
+            print(f"  [{fold_label}] Epoch {epoch:03d}/{num_epochs} | "
+                  f"Loss: {loss:.4f} | Val Acc: {acc:.4f} | Val F1: {f1:.4f}")
+            last_val_f1 = f1
+            if f1 > best_f1 + min_delta:
+                best_f1          = f1
+                patience_counter = 0
+                if cfg_run.get("save_best", cfg.get("save_best", True)):
+                    best_model_path = save_dir / f"best_{fold_label}.pth"
+                    torch.save(model.state_dict(), best_model_path)
+            else:
+                patience_counter += 1
+                if patience > 0 and patience_counter >= patience:
+                    print(f"  [{fold_label}] Early stopping at epoch {epoch} "
+                          f"(best Val F1: {best_f1:.4f}).")
+                    break
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                if last_val_f1 >= 0:
+                    scheduler.step(last_val_f1)
+            else:
+                scheduler.step()
+
+    duration = time.time() - start_time
+    print(f"  [{fold_label}] Training finished in {duration:.1f}s  (best Val F1: {best_f1:.4f}).")
+
+    # Reload best checkpoint so the returned model has the best weights
+    if best_model_path and Path(best_model_path).exists():
+        model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
+
+    # Final val evaluation
+    val_preds, val_labels, val_probs = test_model(model, val_loader)
+    val_acc = float(accuracy_score(val_labels, val_preds))
+    val_f1  = float(f1_score(val_labels, val_preds, average="weighted"))
+
+    # Persist full model state dict
+    model_save_path = save_dir / f"temporal_spatial_classifier_state_{fold_label}.pth"
+    torch.save(model.state_dict(), model_save_path)
+
+    return {
+        "model":           model,
+        "best_model_path": best_model_path,
+        "model_save_path": model_save_path,
+        "best_f1":         best_f1 if best_f1 >= 0 else val_f1,
+        "val_acc":         val_acc,
+        "val_f1":          val_f1,
+        "val_preds":       val_preds,
+        "val_labels":      val_labels,
+        "val_probs":       val_probs,
+        "duration":        duration,
+    }
+
+
 def main(base_path: Path):
     """
     Main function to run the training and evaluation pipeline.
@@ -392,44 +627,14 @@ def main(base_path: Path):
             "duration_seconds",
         ]
 
-        # Resolve processed data cache path
-        default_processed = base_path / "Dataset" / "TransientData" / "processedData.csv"
-        processed_data_path = Path(cfg.get("processed_data_path", default_processed))
-        processed_data_path = processed_data_path if processed_data_path.is_absolute() else (base_path / processed_data_path)
-
-        if processed_data_path.exists():
-            # Fast path: load cached preprocessed data
-            print(f"Loading preprocessed data from {processed_data_path}...")
-            final_df = pd.read_csv(processed_data_path)
-            print("Preprocessed data loaded.")
-        else:
-            # Full preprocessing pipeline
-            print("Loading and preprocessing data...")
-            attribute_df, node_df = load_and_preprocess_data(base_path=str(base_path))
-            print("Data loading and preprocessing complete.")
-
-            # Filter timestamps based on missing nodes
-            print("\nFiltering timestamps...")
-            all_node_ids = set(node_df["ComputerNo"].unique())
-            nodes_per_timestamp = attribute_df.groupby("TimeStamp")["Compno"].nunique()
-            total_nodes = len(all_node_ids)
-            timestamps_to_keep = nodes_per_timestamp[total_nodes - nodes_per_timestamp <= 2].index
-            original_timestamp_count = len(attribute_df["TimeStamp"].unique())
-            attribute_df = attribute_df[attribute_df["TimeStamp"].isin(timestamps_to_keep)]
-            filtered_timestamp_count = len(attribute_df["TimeStamp"].unique())
-            print(f"Filtered timestamps from {original_timestamp_count} to {filtered_timestamp_count}.")
-            print(f"Keeping timestamps with {total_nodes - 2} or more nodes.")
-
-            print("\nLoading graph data...")
-            _data_path = cfg.get("data_path", str(base_path / "Dataset" / "TransientData" / "processedData.csv"))#"corrected1_df.csv"))
-            data_path = Path(_data_path) if Path(_data_path).is_absolute() else (base_path / _data_path)
-            final_df = pd.read_csv(data_path)
-            print("Graph data loaded.")
-
-            # Save for future runs
-            processed_data_path.parent.mkdir(parents=True, exist_ok=True)
-            final_df.to_csv(processed_data_path, index=False)
-            print(f"Preprocessed data saved to {processed_data_path}.")
+        # Load data from configured path (processedData.csv by default)
+        default_data_path = base_path / "Dataset" / "TransientData" / "processedData.csv"
+        _data_path = cfg.get("data_path", str(default_data_path))
+        data_path = Path(_data_path) if Path(_data_path).is_absolute() else (base_path / _data_path)
+        
+        print(f"\nLoading data from {data_path}...")
+        final_df = pd.read_csv(data_path)
+        print(f"Data loaded: {len(final_df)} rows, {len(final_df['TimeStamp'].unique())} timestamps.")
 
         # Plot nodes per timestamp
         if cfg.get("plot_nodes_per_timestamp", True):
@@ -455,8 +660,28 @@ def main(base_path: Path):
                 node_col="Compno_x",
             )
 
-        # Create dataset
-        dataset = create_temporal_dataset(final_df)
+        # Create dataset with optional seasonal normalization and lag features
+        seasonal_norm = cfg.get("seasonal_normalization", True)
+        add_lag_features = cfg.get("add_lag_features", True)
+        
+        # Get num_classes for target discretization (handle list from grid search)
+        _nc = cfg.get("num_classes", 5)
+        n_classes_for_dataset = int(_nc[0] if isinstance(_nc, list) else _nc)
+        
+        dataset = create_temporal_dataset(
+            final_df, 
+            seasonal_normalization=seasonal_norm,
+            add_lag_features=add_lag_features,
+            n_classes=n_classes_for_dataset,
+        )
+        
+        # Dynamically determine in_channels from actual data
+        actual_in_channels = dataset.features[0].shape[1]
+        print(f"\n[DYNAMIC] Detected in_channels = {actual_in_channels} from data")
+        if cfg.get("in_channels") != actual_in_channels:
+            print(f"  Updating in_channels from config value {cfg.get('in_channels')} → {actual_in_channels}")
+            cfg["in_channels"] = actual_in_channels
+        
         print("\n" + "=" * 50)
         print(" " * 18 + "DATASET INFO")
         print("=" * 50)
@@ -473,9 +698,11 @@ def main(base_path: Path):
         outer_train_ratio = 1.0 - test_holdout_ratio
         print(f"\nOuter hold-out split: {outer_train_ratio:.0%} train+val / {test_holdout_ratio:.0%} final test...")
         if bool(cfg.get("stratified_split", False)):
-            from masters_research.pipeline.dataset import stratified_temporal_signal_split
-            trainval_dataset, final_test_dataset = stratified_temporal_signal_split(
-                dataset, train_ratio=outer_train_ratio, num_classes=overall_num_classes
+            from masters_research.pipeline.dataset import interleaved_temporal_split
+            print("  Outer split strategy: interleaved (systematic) sampling — each season is proportionally")
+            print("  represented in both the train+val pool and the final test set.")
+            trainval_dataset, final_test_dataset = interleaved_temporal_split(
+                dataset, train_ratio=outer_train_ratio
             )
         else:
             trainval_dataset, final_test_dataset = temporal_signal_split(dataset, train_ratio=outer_train_ratio)
@@ -513,38 +740,41 @@ def main(base_path: Path):
             _nc_run = cfg_run.get("num_classes", cfg.get("num_classes", 5))
             num_classes_run = int(_nc_run[0] if isinstance(_nc_run, list) else _nc_run)
 
-            # Inner split of train+val pool for this grid run (final_test_dataset is never touched here)
-            print("\nSplitting train+val pool into train / validation sets for this run...")
-            train_ratio_val = cfg_run.get("train_ratio", cfg.get("train_ratio", 0.8))
-            if bool(cfg_run.get("stratified_split", cfg.get("stratified_split", False))):
-                from masters_research.pipeline.dataset import stratified_temporal_signal_split
-                train_dataset, val_dataset = stratified_temporal_signal_split(
-                    trainval_dataset,
-                    train_ratio=float(train_ratio_val),
-                    num_classes=num_classes_run,
-                )
+            # Resolve number of CV folds (1 = single inner split, >1 = walk-forward CV)
+            n_cv_folds = int(cfg_run.get("n_cv_folds", cfg.get("n_cv_folds", 1)))
+
+            # Inner split of train+val pool — skipped when using walk-forward CV
+            train_dataset = None
+            val_dataset   = None
+            if n_cv_folds <= 1:
+                print("\nSplitting train+val pool into train / validation sets for this run...")
+                train_ratio_val = cfg_run.get("train_ratio", cfg.get("train_ratio", 0.8))
+                if bool(cfg_run.get("stratified_split", cfg.get("stratified_split", False))):
+                    from masters_research.pipeline.dataset import stratified_temporal_signal_split
+                    train_dataset, val_dataset = stratified_temporal_signal_split(
+                        trainval_dataset,
+                        train_ratio=float(train_ratio_val),
+                        num_classes=num_classes_run,
+                    )
+                else:
+                    train_dataset, val_dataset = temporal_signal_split(
+                        trainval_dataset, train_ratio=train_ratio_val
+                    )
+                print("Dataset splitting complete.")
+                _print_class_balance_for_dataset(f"Train set ({run_id})", train_dataset, num_classes=num_classes_run)
+                _print_class_balance_for_dataset(f"Val set ({run_id})", val_dataset, num_classes=num_classes_run)
+                if cfg_run.get("temporal_quality_audit", cfg.get("temporal_quality_audit", True)):
+                    compare_splits(
+                        train_dataset,
+                        val_dataset,
+                        name_a=f"Train ({run_id})",
+                        name_b=f"Val ({run_id})",
+                        num_classes=num_classes_run,
+                        plots_dir=plots_dir,
+                        plot_prefix=f"inner_split_{run_id}",
+                    )
             else:
-                train_dataset, val_dataset = temporal_signal_split(
-                    trainval_dataset, train_ratio=train_ratio_val
-                )
-            print("Dataset splitting complete.")
-
-            # Class balance after splitting (per run)
-            _print_class_balance_for_dataset(f"Train set ({run_id})", train_dataset, num_classes=num_classes_run)
-            _print_class_balance_for_dataset(f"Val set ({run_id})", val_dataset, num_classes=num_classes_run)
-            if cfg_run.get("temporal_quality_audit", cfg.get("temporal_quality_audit", True)):
-                compare_splits(
-                    train_dataset,
-                    val_dataset,
-                    name_a=f"Train ({run_id})",
-                    name_b=f"Val ({run_id})",
-                    num_classes=num_classes_run,
-                    plots_dir=plots_dir,
-                    plot_prefix=f"inner_split_{run_id}",
-                )
-
-            train_loader = TemporalDataLoader(train_dataset)
-            val_loader = TemporalDataLoader(val_dataset)
+                print(f"\nWalk-forward CV ({n_cv_folds} folds): skipping single inner split.")
 
             # Device selection
             cfg_device = cfg_run.get("device", cfg.get("device", None))
@@ -556,155 +786,87 @@ def main(base_path: Path):
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             print(f"\nUsing device: {device}")
 
-            # Model
-            use_attention = bool(cfg_run.get("use_attention", cfg.get("use_attention", False)))
-            if use_attention:
-                try:
-                    from masters_research.models.temporal_spatial_attention import TemporalSpatialAttentionNodeClassifier
-                    model = TemporalSpatialAttentionNodeClassifier(
-                        in_channels=int(cfg_run.get("in_channels", cfg.get("in_channels", 8))),
-                        hidden_channels=int(cfg_run.get("hidden_channels", cfg.get("hidden_channels", 16))),
-                        num_classes=int(cfg_run.get("num_classes", cfg.get("num_classes", 5))),
-                        heads=int(cfg_run.get("gat_heads", cfg.get("gat_heads", 4)))
-                    ).to(device)
-                except Exception:
-                    print("Attention model unavailable; falling back to baseline GCN model.")
-                    model = TemporalSpatialNodeClassifier(
-                        in_channels=int(cfg_run.get("in_channels", cfg.get("in_channels", 8))),
-                        hidden_channels=int(cfg_run.get("hidden_channels", cfg.get("hidden_channels", 16))),
-                        num_classes=int(cfg_run.get("num_classes", cfg.get("num_classes", 5))),
-                    ).to(device)
-            else:
-                model = TemporalSpatialNodeClassifier(
-                    in_channels=int(cfg_run.get("in_channels", cfg.get("in_channels", 8))),
-                    hidden_channels=int(cfg_run.get("hidden_channels", cfg.get("hidden_channels", 16))),
-                    num_classes=int(cfg_run.get("num_classes", cfg.get("num_classes", 5))),
-                ).to(device)
-            print("\n" + "=" * 50)
-            print(" " * 15 + "MODEL ARCHITECTURE")
-            print("=" * 50)
-            print(model)
-            print("=" * 50 + "\n")
+            # ---------------------------------------------------------------
+            # Walk-forward temporal CV  (n_cv_folds > 1)  OR single run
+            # ---------------------------------------------------------------
+            if n_cv_folds > 1:
+                from masters_research.pipeline.dataset import walk_forward_cv_split
+                print(f"\nGenerating {n_cv_folds} expanding-window CV folds from the train+val pool...")
+                cv_folds = list(walk_forward_cv_split(trainval_dataset, n_folds=n_cv_folds))
+                if not cv_folds:
+                    print("  Warning: dataset too small for walk-forward CV; falling back to single inner split.")
+                    n_cv_folds = 1
 
-            opt_name = str(cfg_run.get("optimizer", cfg.get("optimizer", "adam"))).lower()
-            if opt_name == "sgd":
-                optimizer = optim.SGD(
-                    model.parameters(),
-                    lr=float(cfg_run.get("lr", cfg.get("lr", 0.001))),
-                    momentum=float(cfg_run.get("momentum", cfg.get("momentum", 0.9))),
-                    weight_decay=float(cfg_run.get("weight_decay", cfg.get("weight_decay", 5e-4))),
-                )
-            else:
-                optimizer = optim.Adam(
-                    model.parameters(),
-                    lr=float(cfg_run.get("lr", cfg.get("lr", 0.001))),
-                    weight_decay=float(cfg_run.get("weight_decay", cfg.get("weight_decay", 5e-4))),
-                )
-            # Class-weighted loss: inverse-frequency weights from training snapshots
-            _train_lbls = np.concatenate([
-                train_dataset[i].y.cpu().numpy().astype(int)
-                for i in range(getattr(train_dataset, "snapshot_count", None) or len(train_dataset))
-            ])
-            _counts = np.bincount(_train_lbls, minlength=num_classes_run).astype(float)
-            _w = 1.0 / np.maximum(_counts, 1)
-            _w = (_w / _w.sum()) * num_classes_run   # normalize so weights sum to num_classes
-            class_weights = torch.tensor(_w, dtype=torch.float).to(device)
-            print(f"Class weights: {[f'{v:.3f}' for v in _w]}")
-
-            # Loss function: Focal Loss (default, gamma=2) or plain weighted CE
-            use_focal = bool(cfg_run.get("focal_loss", cfg.get("focal_loss", True)))
-            focal_gamma = float(cfg_run.get("focal_gamma", cfg.get("focal_gamma", 2.0)))
-            if use_focal:
-                criterion = FocalLoss(gamma=focal_gamma, weight=class_weights)
-                print(f"Using Focal Loss (gamma={focal_gamma})")
-            else:
-                criterion = nn.CrossEntropyLoss(weight=class_weights)
-                print("Using weighted CrossEntropyLoss")
-
-            # Optional scheduler
-            scheduler_cfg = cfg_run.get("scheduler", cfg.get("scheduler", None))
-            scheduler = None
-            if isinstance(scheduler_cfg, dict):
-                _sname = scheduler_cfg.get("name", "")
-                if _sname == "StepLR":
-                    scheduler = torch.optim.lr_scheduler.StepLR(
-                        optimizer,
-                        step_size=int(scheduler_cfg.get("step_size", 10)),
-                        gamma=float(scheduler_cfg.get("gamma", 0.5)),
+            if n_cv_folds > 1:
+                fold_results      = []
+                fold_val_datasets = []
+                for fold_train, fold_val, fold_num in cv_folds:
+                    fold_id = f"{run_id}_fold{fold_num}"
+                    print(f"\n--- CV Fold {fold_num}/{len(cv_folds)} "
+                          f"| train: {fold_train.snapshot_count} snapshots "
+                          f"| val: {fold_val.snapshot_count} snapshots ---")
+                    _print_class_balance_for_dataset(f"Fold {fold_num} train", fold_train, num_classes=num_classes_run)
+                    _print_class_balance_for_dataset(f"Fold {fold_num} val",   fold_val,   num_classes=num_classes_run)
+                    result = _train_one_fold(
+                        fold_id, fold_train, fold_val,
+                        cfg_run, cfg, device, save_dir, num_classes_run,
                     )
-                elif _sname == "ReduceLROnPlateau":
-                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                        optimizer,
-                        mode="max",
-                        factor=float(scheduler_cfg.get("factor", 0.5)),
-                        patience=int(scheduler_cfg.get("patience", 10)),
-                        min_lr=float(scheduler_cfg.get("min_lr", 1e-6)),
-                    )
-                    print(f"Using ReduceLROnPlateau scheduler (factor={scheduler_cfg.get('factor', 0.5)}, patience={scheduler_cfg.get('patience', 10)})")
+                    fold_results.append(result)
+                    fold_val_datasets.append(fold_val)
 
-            # Training loop
-            print("Starting model training...")
-            start_time = time.time()
-            best_f1 = -1.0
-            best_model_path = None
-            eval_interval = int(cfg_run.get("eval_interval", cfg.get("eval_interval", 1)))
-            min_delta = float(cfg_run.get("early_stopping_min_delta", cfg.get("early_stopping_min_delta", 0.0)))
-            patience = int(cfg_run.get("early_stopping_patience", cfg.get("early_stopping_patience", 0)))
-            patience_counter = 0
-            grad_clip = cfg_run.get("grad_clip", cfg.get("grad_clip", None))
-            last_val_f1 = -1.0
+                cv_val_f1_scores  = [r["val_f1"]  for r in fold_results]
+                cv_val_acc_scores = [r["val_acc"] for r in fold_results]
+                print(f"\nWalk-forward CV summary ({run_id}):")
+                for k, (fv, fa) in enumerate(zip(cv_val_f1_scores, cv_val_acc_scores)):
+                    print(f"  Fold {k + 1}: Val Acc={fa:.4f}  Val F1={fv:.4f}")
+                print(f"  Mean Val F1: {np.mean(cv_val_f1_scores):.4f}  "
+                      f"Std: {np.std(cv_val_f1_scores):.4f}")
 
-            for epoch in range(1, int(cfg_run.get("epochs", cfg.get("epochs", 200))) + 1):
-                print(f"\nEpoch {epoch}/{int(cfg_run.get('epochs', cfg.get('epochs', 200)))}")
-                loss = train_epoch(model, optimizer, criterion, train_loader, grad_clip=grad_clip)
+                best_fold_idx    = int(np.argmax(cv_val_f1_scores))
+                best_fold_result = fold_results[best_fold_idx]
+                val_dataset      = fold_val_datasets[best_fold_idx]
+                print(f"  Best fold: Fold {best_fold_idx + 1} "
+                      f"(Val F1={best_fold_result['val_f1']:.4f})")
 
-                # Evaluate per interval
-                do_eval = (epoch % eval_interval == 0) or (
-                    epoch == int(cfg_run.get("epochs", cfg.get("epochs", 200)))
+                model           = best_fold_result["model"]
+                final_acc       = float(np.mean(cv_val_acc_scores))
+                final_f1        = float(np.mean(cv_val_f1_scores))
+                best_model_path = best_fold_result["best_model_path"]
+                model_save_path = best_fold_result["model_save_path"]
+                best_f1         = best_fold_result["best_f1"]
+                duration        = sum(r["duration"] for r in fold_results)
+                final_preds     = best_fold_result["val_preds"]
+                final_labels    = best_fold_result["val_labels"]
+                final_probs     = best_fold_result["val_probs"]
+
+                print("\n" + "=" * 50)
+                print(" " * 15 + "BEST FOLD MODEL")
+                print("=" * 50)
+                print(model)
+                print("=" * 50 + "\n")
+
+            else:
+                # ---- Single inner split (original behaviour) ----
+                result = _train_one_fold(
+                    run_id, train_dataset, val_dataset,
+                    cfg_run, cfg, device, save_dir, num_classes_run,
                 )
-                if do_eval:
-                    preds, labels, probs = test_model(model, val_loader)
-                    accuracy = accuracy_score(labels, preds)
-                    f1 = f1_score(labels, preds, average="weighted")
-                    print(
-                        f"Epoch {epoch:03d} | Train Loss: {loss:.4f} | Val Acc: {accuracy:.4f} | Val F1: {f1:.4f}"
-                    )
+                model           = result["model"]
+                final_acc       = result["val_acc"]
+                final_f1        = result["val_f1"]
+                best_model_path = result["best_model_path"]
+                model_save_path = result["model_save_path"]
+                best_f1         = result["best_f1"]
+                duration        = result["duration"]
+                final_preds     = result["val_preds"]
+                final_labels    = result["val_labels"]
+                final_probs     = result["val_probs"]
 
-                    last_val_f1 = f1
-
-                    # Track best and optionally save
-                    if f1 > best_f1 + min_delta:
-                        best_f1 = f1
-                        patience_counter = 0
-                        if cfg_run.get("save_best", cfg.get("save_best", True)):
-                            best_model_path = save_dir / f"best_{run_id}.pth"
-                            torch.save(model.state_dict(), best_model_path)
-                            print(f"Saved best model to {best_model_path}")
-                    else:
-                        patience_counter += 1
-                        if patience > 0 and patience_counter >= patience:
-                            print(f"Early stopping: no improvement for {patience} eval steps (best Val F1: {best_f1:.4f}).")
-                            break
-
-                if scheduler is not None:
-                    if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                        if last_val_f1 >= 0:
-                            scheduler.step(last_val_f1)
-                    else:
-                        scheduler.step()
-
-            duration = time.time() - start_time
-            print(f"Model training finished in {duration:.1f}s.")
-
-            # Reload best checkpoint before final evaluation
-            if best_model_path and Path(best_model_path).exists():
-                print(f"Reloading best checkpoint ({best_model_path.name}) for final evaluation...")
-                model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
-
-            # Final evaluation on validation set (used for grid search ranking)
-            final_preds, final_labels, final_probs = test_model(model, val_loader)
-            final_acc = float(accuracy_score(final_labels, final_preds))
-            final_f1 = float(f1_score(final_labels, final_preds, average="weighted"))
+                print("\n" + "=" * 50)
+                print(" " * 15 + "MODEL ARCHITECTURE")
+                print("=" * 50)
+                print(model)
+                print("=" * 50 + "\n")
 
             # Held-out final test evaluation (informational only; no decisions made here)
             print("Evaluating on held-out final test set...")
@@ -713,10 +875,7 @@ def main(base_path: Path):
             ht_f1 = float(f1_score(ht_labels, ht_preds, average="weighted"))
             print(f"Final test set  | Acc: {ht_acc:.4f} | F1: {ht_f1:.4f}")
 
-            model_save_path = save_dir / f"temporal_spatial_classifier_state_{run_id}.pth"
-            print(f"Saving model to {model_save_path}...")
-            torch.save(model.state_dict(), model_save_path)
-            print(f"Model saved to {model_save_path}")
+            print(f"Model state saved to {model_save_path}.")
 
             # Append results to CSV
             row = {
@@ -769,6 +928,8 @@ def main(base_path: Path):
                         "AverageTotalRadiation_x",
                         "AverageWindSpeed_x",
                         "AverageTotalRelativeEvaporation_x",
+                        "month_sin",
+                        "month_cos",
                     ]
                     # Determine edge weight tensor attribute name across library versions
                     edge_weight_src = getattr(test_snapshot, 'edge_weight', None)
@@ -778,7 +939,7 @@ def main(base_path: Path):
                     explain_nodes = int(cfg_run.get("gnnexplainer_nodes", cfg.get("gnnexplainer_nodes", 5)))
                     node_indices = list(range(min(explain_nodes, num_nodes)))
                     explainer = Explainer(
-                        model=model,
+                        model=_ExplainWrapper(model),
                         algorithm=GNNExplainer(epochs=int(cfg_run.get("gnnexplainer_epochs", cfg.get("gnnexplainer_epochs", 100)))),
                         explanation_type='model',
                         node_mask_type='attributes',
@@ -855,6 +1016,8 @@ def main(base_path: Path):
                         "AverageTotalRadiation_x",
                         "AverageWindSpeed_x",
                         "AverageTotalRelativeEvaporation_x",
+                        "month_sin",
+                        "month_cos",
                     ]
                     # Determine edge weight tensor attribute name across library versions
                     edge_weight_src = getattr(test_snapshot, 'edge_weight', None)
@@ -870,7 +1033,8 @@ def main(base_path: Path):
                     per_class_attr = {c: [] for c in range(num_classes_cfg)}
                     for idx in node_indices:
                         def forward_node(x):
-                            logits = model(x, test_snapshot.edge_index, edge_weight_src)
+                            result = model(x, test_snapshot.edge_index, edge_weight_src)
+                            logits = result[0] if isinstance(result, tuple) else result
                             return logits[idx].unsqueeze(0)
 
                         ig = IntegratedGradients(forward_node)
