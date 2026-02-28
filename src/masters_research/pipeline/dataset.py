@@ -266,20 +266,33 @@ def create_temporal_dataset(
             dtype=torch.float,
         )
 
-        # Cyclical month encoding (sin + cos) — gives the model explicit seasonal context
-        # to address the high Feature Drift score.  Using sin/cos avoids the ordinal
-        # discontinuity between December (month 12) and January (month 1).
-        #   January  →  sin=0.00, cos=1.00
-        #   April    →  sin=0.87, cos=0.50
-        #   July     →  sin=0.87, cos=-0.50  (opposite to January — hottest month)
-        #   October  →  sin=-0.87, cos=-0.50
+        # Multi-harmonic Fourier encoding for seasonality
+        # Multiple harmonics help the model capture different seasonal patterns:
+        #   - 1st harmonic (annual): main seasonal cycle
+        #   - 2nd harmonic (semi-annual): wet/dry seasons, equinox patterns  
+        #   - Day-of-year: finer granularity than monthly
+        # This creates a richer representation that prevents the model from 
+        # getting stuck in local minima that only fit one season.
         ts_dt = pd.Timestamp(timestamp) if not isinstance(timestamp, pd.Timestamp) else timestamp
-        month_rad = 2.0 * np.pi * (ts_dt.month - 1) / 12.0
-        month_enc = torch.tensor(
-            [[float(np.sin(month_rad)), float(np.cos(month_rad))]] * x.size(0),
+        
+        # Day of year (1-366) for finer temporal resolution
+        day_of_year = ts_dt.timetuple().tm_yday
+        year_progress = day_of_year / 365.25  # Normalized to [0, 1]
+        
+        # Multi-harmonic encoding (annual + semi-annual cycles)
+        # k=1: annual cycle (1 full wave per year)
+        # k=2: semi-annual cycle (2 waves per year - captures wet/dry, equinox)
+        fourier_features = []
+        for k in [1, 2]:  # harmonics
+            angle = 2.0 * np.pi * k * year_progress
+            fourier_features.extend([float(np.sin(angle)), float(np.cos(angle))])
+        
+        # Stack: [sin_1, cos_1, sin_2, cos_2] = 4 features
+        temporal_enc = torch.tensor(
+            [fourier_features] * x.size(0),
             dtype=torch.float,
         )
-        x = torch.cat([x, month_enc], dim=1)   # [num_nodes, base_features + lag_features + 2]
+        x = torch.cat([x, temporal_enc], dim=1)   # [num_nodes, base_features + lag_features + 4]
 
         # Edge indices
         edge_indices = torch.tensor(df_timestamp[["Compno_x", "Compno_y"]].values.T, dtype=torch.long)

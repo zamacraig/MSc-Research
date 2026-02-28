@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -32,7 +33,7 @@ except Exception:
 
 from masters_research.data import TemporalDataLoader
 from masters_research.pipeline.dataset import create_temporal_dataset
-from masters_research.models import TemporalSpatialNodeClassifier
+from masters_research.models import TemporalSpatialNodeClassifier, SimpleGCNClassifier
 from masters_research.pipeline.temporal_quality import run_temporal_quality_audit, compare_splits
 import seaborn as sns
 
@@ -41,16 +42,36 @@ class FocalLoss(nn.Module):
     """Multi-class Focal Loss: down-weights easy examples so the model focuses on hard ones.
     Useful when temporal distribution shift causes the test classes to differ from training.
     gamma=0 reduces to standard cross-entropy.
+    
+    Added label_smoothing to prevent overconfident predictions that lead to mode collapse.
     """
-    def __init__(self, gamma: float = 2.0, weight: torch.Tensor | None = None):
+    def __init__(self, gamma: float = 2.0, weight: torch.Tensor | None = None, label_smoothing: float = 0.0):
         super().__init__()
         self.gamma = gamma
         self.weight = weight
+        self.label_smoothing = label_smoothing
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce = nn.functional.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
+        ce = nn.functional.cross_entropy(
+            inputs, targets, weight=self.weight, reduction='none',
+            label_smoothing=self.label_smoothing
+        )
         pt = torch.exp(-ce)
         return (((1.0 - pt) ** self.gamma) * ce).mean()
+
+
+def entropy_regularization(logits: torch.Tensor) -> torch.Tensor:
+    """Compute negative entropy of predictions to encourage diverse class predictions.
+    
+    When entropy is low, the model is confidently predicting one class (bad - mode collapse).
+    When entropy is high, predictions are spread across classes (good - diverse).
+    
+    Returns: negative entropy (minimize this to maximize entropy / diversity)
+    """
+    probs = torch.softmax(logits, dim=-1)
+    log_probs = torch.log_softmax(logits, dim=-1)
+    entropy = -(probs * log_probs).sum(dim=-1).mean()
+    return -entropy  # Negative because we want to MAXIMIZE entropy
 
 
 class _ExplainWrapper(nn.Module):
@@ -78,7 +99,12 @@ def load_config(config_path: Path) -> dict:
     return cfg
 
 
-def train_epoch(model, optimizer, criterion, train_loader, grad_clip=None):
+def train_epoch(model, optimizer, criterion, train_loader, grad_clip=None, entropy_weight=0.0):
+    """Train for one epoch with optional entropy regularization.
+    
+    entropy_weight: coefficient for entropy regularization (0.0 = disabled).
+                   Higher values encourage more diverse predictions, preventing mode collapse.
+    """
     model.train()
     total_loss = 0
     loader_len = len(list(train_loader))
@@ -94,6 +120,14 @@ def train_epoch(model, optimizer, criterion, train_loader, grad_clip=None):
             hidden = hidden.detach()  # truncated BPTT — don't backprop through prior snapshots
         targets_long = snapshot.y.clone().to(torch.long)
         loss = criterion(out, targets_long)
+        
+        # Add entropy regularization to prevent mode collapse
+        # When model collapses to predicting one class, entropy is low
+        # This term encourages spreading predictions across classes
+        if entropy_weight > 0:
+            entropy_loss = entropy_regularization(out)
+            loss = loss + entropy_weight * entropy_loss
+        
         loss.backward()
         if grad_clip is not None and float(grad_clip) > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
@@ -403,13 +437,26 @@ def _train_one_fold(
     # --- Model ---
     use_attention = bool(cfg_run.get("use_attention", cfg.get("use_attention", False)))
     use_temporal_attention = bool(cfg_run.get("use_temporal_attention", cfg.get("use_temporal_attention", False)))
+    use_simple_gcn = bool(cfg_run.get("use_simple_gcn", cfg.get("use_simple_gcn", False)))
     _gru_layers   = int(cfg_run.get("gru_layers",    cfg.get("gru_layers",    1)))
     _input_norm   = bool(cfg_run.get("input_norm",   cfg.get("input_norm",    True)))
     _in_channels  = int(cfg_run.get("in_channels", cfg.get("in_channels", 10)))
     _hidden_channels = int(cfg_run.get("hidden_channels", cfg.get("hidden_channels", 16)))
     _dropout = float(cfg_run.get("dropout", cfg.get("dropout", 0.3)))
+    _gcn_layers = int(cfg_run.get("gcn_layers", cfg.get("gcn_layers", 3)))
     
-    if use_temporal_attention:
+    if use_simple_gcn:
+        # Simple GCN model WITHOUT GRU - tests if recurrent component causes collapse
+        print(f"  [{fold_label}] Using SimpleGCNClassifier (no GRU, {_gcn_layers} GCN layers, dropout={_dropout})")
+        model = SimpleGCNClassifier(
+            in_channels=_in_channels,
+            hidden_channels=_hidden_channels,
+            num_classes=num_classes_run,
+            dropout=_dropout,
+            input_norm=_input_norm,
+            num_layers=_gcn_layers,
+        ).to(device)
+    elif use_temporal_attention:
         # New temporal attention model with history buffer
         from masters_research.models.temporal_attention_gnn import TemporalAttentionGNN
         _history_len = int(cfg_run.get("temporal_history_len", cfg.get("temporal_history_len", 10)))
@@ -489,12 +536,18 @@ def _train_one_fold(
     # --- Loss function ---
     use_focal   = bool(cfg_run.get("focal_loss",  cfg.get("focal_loss",  True)))
     focal_gamma = float(cfg_run.get("focal_gamma", cfg.get("focal_gamma", 2.0)))
+    label_smoothing = float(cfg_run.get("label_smoothing", cfg.get("label_smoothing", 0.0)))
+    entropy_weight = float(cfg_run.get("entropy_reg", cfg.get("entropy_reg", 0.0)))
+    
     if use_focal:
-        criterion = FocalLoss(gamma=focal_gamma, weight=class_weights)
-        print(f"  [{fold_label}] Using Focal Loss (gamma={focal_gamma})")
+        criterion = FocalLoss(gamma=focal_gamma, weight=class_weights, label_smoothing=label_smoothing)
+        print(f"  [{fold_label}] Using Focal Loss (gamma={focal_gamma}, label_smoothing={label_smoothing})")
     else:
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-        print(f"  [{fold_label}] Using weighted CrossEntropyLoss")
+        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+        print(f"  [{fold_label}] Using weighted CrossEntropyLoss (label_smoothing={label_smoothing})")
+    
+    if entropy_weight > 0:
+        print(f"  [{fold_label}] Entropy regularization enabled (weight={entropy_weight})")
 
     # --- Scheduler ---
     scheduler_cfg = cfg_run.get("scheduler", cfg.get("scheduler", None))
@@ -530,9 +583,21 @@ def _train_one_fold(
     grad_clip       = cfg_run.get("grad_clip", cfg.get("grad_clip", None))
     last_val_f1     = -1.0
     num_epochs      = int(cfg_run.get("epochs", cfg.get("epochs", 200)))
+    
+    # SWA (Stochastic Weight Averaging) - helps escape local minima by averaging weights
+    # from multiple points in the training trajectory, finding flatter minima that generalize better
+    use_swa = cfg_run.get("use_swa", cfg.get("use_swa", False))
+    swa_start_epoch = int(cfg_run.get("swa_start_epoch", cfg.get("swa_start_epoch", 20)))
+    swa_lr = float(cfg_run.get("swa_lr", cfg.get("swa_lr", 0.0005)))
+    swa_model = None
+    swa_scheduler = None
+    if use_swa:
+        swa_model = AveragedModel(model)
+        swa_scheduler = SWALR(optimizer, swa_lr=swa_lr)
+        print(f"  [{fold_label}] SWA enabled: starts at epoch {swa_start_epoch}, swa_lr={swa_lr}")
 
     for epoch in range(1, num_epochs + 1):
-        loss = train_epoch(model, optimizer, criterion, train_loader, grad_clip=grad_clip)
+        loss = train_epoch(model, optimizer, criterion, train_loader, grad_clip=grad_clip, entropy_weight=entropy_weight)
         do_eval = (epoch % eval_interval == 0) or (epoch == num_epochs)
         if do_eval:
             preds, labels, probs = test_model(model, val_loader)
@@ -559,12 +624,39 @@ def _train_one_fold(
                     scheduler.step(last_val_f1)
             else:
                 scheduler.step()
+        
+        # SWA: update averaged model after warmup period
+        if use_swa and epoch >= swa_start_epoch:
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
 
     duration = time.time() - start_time
     print(f"  [{fold_label}] Training finished in {duration:.1f}s  (best Val F1: {best_f1:.4f}).")
 
-    # Reload best checkpoint so the returned model has the best weights
-    if best_model_path and Path(best_model_path).exists():
+    # Update batch normalization statistics for SWA model
+    if use_swa and swa_model is not None:
+        print(f"  [{fold_label}] Updating SWA batch norm statistics...")
+        # Create a simple loader for BN update (iterate through training data)
+        try:
+            update_bn(train_loader, swa_model, device=device)
+        except Exception as e:
+            print(f"  [{fold_label}] SWA BN update skipped (no BN layers or error: {e})")
+        
+        # Compare SWA model vs best checkpoint
+        swa_preds, swa_labels, swa_probs = test_model(swa_model, val_loader)
+        swa_f1 = float(f1_score(swa_labels, swa_preds, average="weighted"))
+        print(f"  [{fold_label}] SWA Val F1: {swa_f1:.4f} (vs best checkpoint: {best_f1:.4f})")
+        
+        # Use SWA model if it's better
+        if swa_f1 > best_f1:
+            print(f"  [{fold_label}] Using SWA model (better than checkpoint)")
+            # Copy SWA weights to the main model
+            model.load_state_dict(swa_model.module.state_dict())
+            best_f1 = swa_f1
+        elif best_model_path and Path(best_model_path).exists():
+            model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
+    elif best_model_path and Path(best_model_path).exists():
+        # Reload best checkpoint so the returned model has the best weights
         model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
 
     # Final val evaluation
