@@ -99,14 +99,201 @@ def load_config(config_path: Path) -> dict:
     return cfg
 
 
-def train_epoch(model, optimizer, criterion, train_loader, grad_clip=None, entropy_weight=0.0):
-    """Train for one epoch with optional entropy regularization.
+def compute_prediction_entropy(logits: torch.Tensor) -> float:
+    """Compute mean entropy of predictions (higher = more diverse, lower = collapse).
+    
+    Returns entropy in bits (log base 2). For 3 classes:
+    - Maximum entropy: log2(3) ≈ 1.58 (uniform predictions)
+    - Minimum entropy: 0 (all predictions same class)
+    """
+    with torch.no_grad():
+        probs = torch.softmax(logits, dim=-1)
+        # Add small epsilon to avoid log(0)
+        log_probs = torch.log2(probs + 1e-10)
+        entropy = -(probs * log_probs).sum(dim=-1).mean()
+        return float(entropy)
+
+
+# ==================== DIAGNOSTIC FUNCTIONS ====================
+
+def diagnose_batchnorm_stability(model, prev_bn_stats=None):
+    """Check BatchNorm running statistics stability.
+    
+    Returns:
+        dict with 'mean_drift', 'var_stability', 'status', and current stats
+    """
+    current_stats = {}
+    mean_drifts = []
+    var_values = []
+    
+    for name, module in model.named_modules():
+        if isinstance(module, nn.BatchNorm1d):
+            running_mean = module.running_mean.detach().cpu().numpy()
+            running_var = module.running_var.detach().cpu().numpy()
+            
+            current_stats[name] = {
+                'mean': running_mean.copy(),
+                'var': running_var.copy()
+            }
+            
+            var_values.append(running_var.mean())
+            
+            # Check drift from previous epoch
+            if prev_bn_stats and name in prev_bn_stats:
+                drift = np.abs(running_mean - prev_bn_stats[name]['mean']).mean()
+                mean_drifts.append(drift)
+    
+    if not current_stats:
+        return {'mean_drift': 0, 'var_stability': 1.0, 'status': 'NO_BN', 'stats': {}}
+    
+    avg_drift = np.mean(mean_drifts) if mean_drifts else 0
+    avg_var = np.mean(var_values) if var_values else 1.0
+    
+    # Determine status
+    if avg_drift > 0.1:
+        status = 'UNSTABLE'
+    elif avg_drift > 0.05:
+        status = 'MODERATE'
+    else:
+        status = 'STABLE'
+    
+    return {
+        'mean_drift': avg_drift,
+        'var_mean': avg_var,
+        'status': status,
+        'stats': current_stats
+    }
+
+
+def diagnose_loss_components(model, criterion, data_snapshot, entropy_weight=0.0):
+    """Compute individual loss components to detect conflicts.
+    
+    Returns:
+        dict with 'focal', 'entropy_term', 'total', 'confidence'
+    """
+    model.eval()
+    with torch.no_grad():
+        result = model(data_snapshot.x, data_snapshot.edge_index, data_snapshot.edge_attr)
+        out = result[0] if isinstance(result, tuple) else result
+        targets = data_snapshot.y.clone().to(torch.long)
+        
+        # Focal/CE loss component
+        focal_loss = criterion(out, targets).item()
+        
+        # Entropy regularization component (if used)
+        entropy_term = 0.0
+        if entropy_weight > 0:
+            entropy_term = entropy_weight * entropy_regularization(out).item()
+        
+        # Model confidence (max probability)
+        probs = torch.softmax(out, dim=-1)
+        confidence = probs.max(dim=-1)[0].mean().item()
+        
+        # Check if predictions are near uniform (sign of over-regularization)
+        uniformity = (probs.std(dim=-1).mean().item())  # Low std = uniform
+        
+    model.train()
+    
+    return {
+        'focal': focal_loss,
+        'entropy_term': entropy_term,
+        'total': focal_loss + entropy_term,
+        'confidence': confidence,
+        'uniformity': uniformity
+    }
+
+
+def diagnose_f1_variance(f1_history, window=5):
+    """Analyze F1 variance over sliding window to detect oscillation.
+    
+    Returns:
+        dict with 'mean', 'std', 'trend', 'status'
+    """
+    if len(f1_history) < window:
+        return {'mean': 0, 'std': 0, 'trend': 0, 'status': 'INSUFFICIENT_DATA'}
+    
+    recent = f1_history[-window:]
+    mean_f1 = np.mean(recent)
+    std_f1 = np.std(recent)
+    
+    # Calculate trend (positive = improving, negative = degrading)
+    if len(f1_history) >= window + 5:
+        prev_window = f1_history[-(window+5):-5]
+        trend = mean_f1 - np.mean(prev_window)
+    else:
+        trend = 0
+    
+    # Determine status
+    if std_f1 > 0.15:
+        status = 'HIGH_OSCILLATION'
+    elif std_f1 > 0.08:
+        status = 'MODERATE_OSCILLATION'
+    else:
+        status = 'STABLE'
+    
+    if trend < -0.1 and status == 'STABLE':
+        status = 'DEGRADING'
+    
+    return {
+        'mean': mean_f1,
+        'std': std_f1,
+        'trend': trend,
+        'status': status
+    }
+
+
+def print_diagnostics(epoch, bn_diag, loss_diag, f1_diag, fold_label):
+    """Print formatted diagnostic summary."""
+    print(f"  [{fold_label}] === DIAGNOSTICS Epoch {epoch} ===")
+    
+    # BatchNorm status
+    bn_status = bn_diag['status']
+    bn_emoji = '✅' if bn_status == 'STABLE' else ('⚠️' if bn_status == 'MODERATE' else '❌')
+    print(f"    BatchNorm: {bn_emoji} {bn_status} (drift={bn_diag['mean_drift']:.4f}, var_mean={bn_diag.get('var_mean', 0):.4f})")
+    
+    # Loss components
+    conf_status = '✅' if loss_diag['confidence'] > 0.5 else ('⚠️' if loss_diag['confidence'] > 0.4 else '❌')
+    print(f"    Loss: Focal={loss_diag['focal']:.4f}, Entropy={loss_diag['entropy_term']:.4f}, "
+          f"Total={loss_diag['total']:.4f}")
+    print(f"    Confidence: {conf_status} {loss_diag['confidence']:.3f} (uniformity={loss_diag['uniformity']:.3f})")
+    
+    # F1 stability
+    if f1_diag['status'] != 'INSUFFICIENT_DATA':
+        f1_emoji = '✅' if f1_diag['status'] == 'STABLE' else ('⚠️' if 'MODERATE' in f1_diag['status'] else '❌')
+        print(f"    F1 Window: {f1_emoji} {f1_diag['status']} (mean={f1_diag['mean']:.4f}, std={f1_diag['std']:.4f}, trend={f1_diag['trend']:+.4f})")
+    
+    # Recommendations
+    recommendations = []
+    if bn_status == 'UNSTABLE':
+        recommendations.append('Consider LayerNorm instead of BatchNorm')
+    if loss_diag['confidence'] < 0.4:
+        recommendations.append('Over-regularized: reduce entropy_reg or label_smoothing')
+    if f1_diag.get('status') == 'HIGH_OSCILLATION':
+        recommendations.append('LR too high: add decay or reduce LR')
+    if f1_diag.get('status') == 'DEGRADING':
+        recommendations.append('Model degrading: consider early stopping sooner')
+    
+    if recommendations:
+        print(f"    💡 RECOMMENDATIONS: {'; '.join(recommendations)}")
+    print()
+
+
+def train_epoch(model, optimizer, criterion, train_loader, grad_clip=None, entropy_weight=0.0, classifier_l2=0.0):
+    """Train for one epoch with optional entropy regularization and classifier L2 penalty.
     
     entropy_weight: coefficient for entropy regularization (0.0 = disabled).
                    Higher values encourage more diverse predictions, preventing mode collapse.
+    classifier_l2: L2 penalty weight on classifier layer only (separate from optimizer weight_decay).
+                  Helps prevent overconfident predictions.
+    
+    Returns:
+        dict with 'loss', 'grad_norm', 'entropy' for monitoring
     """
     model.train()
     total_loss = 0
+    total_grad_norm = 0
+    total_entropy = 0
+    num_batches = 0
     loader_len = len(list(train_loader))
     hidden = None  # GRU hidden state carried across snapshots within the epoch
     # Reset temporal attention history buffer at start of each epoch
@@ -121,6 +308,10 @@ def train_epoch(model, optimizer, criterion, train_loader, grad_clip=None, entro
         targets_long = snapshot.y.clone().to(torch.long)
         loss = criterion(out, targets_long)
         
+        # Track prediction entropy for collapse detection
+        batch_entropy = compute_prediction_entropy(out)
+        total_entropy += batch_entropy
+        
         # Add entropy regularization to prevent mode collapse
         # When model collapses to predicting one class, entropy is low
         # This term encourages spreading predictions across classes
@@ -128,12 +319,37 @@ def train_epoch(model, optimizer, criterion, train_loader, grad_clip=None, entro
             entropy_loss = entropy_regularization(out)
             loss = loss + entropy_weight * entropy_loss
         
+        # Add L2 penalty on classifier layer (separate from weight_decay)
+        # This helps prevent overconfident predictions by penalizing large classifier weights
+        if classifier_l2 > 0 and hasattr(model, 'classifier'):
+            l2_penalty = sum(p.pow(2).sum() for p in model.classifier.parameters())
+            loss = loss + classifier_l2 * l2_penalty
+        
         loss.backward()
+        
+        # Monitor gradient norm before clipping
+        grad_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                grad_norm += p.grad.data.norm(2).item() ** 2
+        grad_norm = grad_norm ** 0.5
+        total_grad_norm += grad_norm
+        
         if grad_clip is not None and float(grad_clip) > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
         optimizer.step()
         total_loss += loss.item()
-    return total_loss / loader_len if loader_len > 0 else total_loss
+        num_batches += 1
+    
+    avg_loss = total_loss / loader_len if loader_len > 0 else total_loss
+    avg_grad_norm = total_grad_norm / num_batches if num_batches > 0 else 0.0
+    avg_entropy = total_entropy / num_batches if num_batches > 0 else 0.0
+    
+    return {
+        'loss': avg_loss,
+        'grad_norm': avg_grad_norm,
+        'entropy': avg_entropy
+    }
 
 
 def test_model(model, loader):
@@ -538,6 +754,7 @@ def _train_one_fold(
     focal_gamma = float(cfg_run.get("focal_gamma", cfg.get("focal_gamma", 2.0)))
     label_smoothing = float(cfg_run.get("label_smoothing", cfg.get("label_smoothing", 0.0)))
     entropy_weight = float(cfg_run.get("entropy_reg", cfg.get("entropy_reg", 0.0)))
+    classifier_l2 = float(cfg_run.get("classifier_l2", cfg.get("classifier_l2", 0.0)))
     
     if use_focal:
         criterion = FocalLoss(gamma=focal_gamma, weight=class_weights, label_smoothing=label_smoothing)
@@ -548,8 +765,11 @@ def _train_one_fold(
     
     if entropy_weight > 0:
         print(f"  [{fold_label}] Entropy regularization enabled (weight={entropy_weight})")
+    if classifier_l2 > 0:
+        print(f"  [{fold_label}] Classifier L2 penalty enabled (weight={classifier_l2})")
 
     # --- Scheduler ---
+    num_epochs      = int(cfg_run.get("epochs", cfg.get("epochs", 200)))  # Needed for scheduler setup
     scheduler_cfg = cfg_run.get("scheduler", cfg.get("scheduler", None))
     scheduler = None
     if isinstance(scheduler_cfg, dict):
@@ -560,6 +780,7 @@ def _train_one_fold(
                 step_size=int(scheduler_cfg.get("step_size", 10)),
                 gamma=float(scheduler_cfg.get("gamma", 0.5)),
             )
+            print(f"  [{fold_label}] StepLR scheduler (step_size={scheduler_cfg.get('step_size', 10)}, gamma={scheduler_cfg.get('gamma', 0.5)})")
         elif _sname == "ReduceLROnPlateau":
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
@@ -570,6 +791,17 @@ def _train_one_fold(
             )
             print(f"  [{fold_label}] ReduceLROnPlateau scheduler "
                   f"(factor={scheduler_cfg.get('factor', 0.5)}, patience={scheduler_cfg.get('patience', 10)})")
+        elif _sname == "CosineAnnealingLR":
+            # Cosine annealing: smoothly decays LR from initial to eta_min over T_max epochs
+            # Helps prevent overfitting by reducing LR as training progresses
+            T_max = int(scheduler_cfg.get("T_max", num_epochs))
+            eta_min = float(scheduler_cfg.get("eta_min", 1e-6))
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=T_max,
+                eta_min=eta_min,
+            )
+            print(f"  [{fold_label}] CosineAnnealingLR scheduler (T_max={T_max}, eta_min={eta_min})")
 
     # --- Training loop ---
     print(f"  [{fold_label}] Starting training...")
@@ -582,7 +814,16 @@ def _train_one_fold(
     patience_counter = 0
     grad_clip       = cfg_run.get("grad_clip", cfg.get("grad_clip", None))
     last_val_f1     = -1.0
-    num_epochs      = int(cfg_run.get("epochs", cfg.get("epochs", 200)))
+    
+    # Learning rate warmup - start at LR/3, linearly ramp to full LR over warmup_epochs
+    warmup_epochs   = int(cfg_run.get("warmup_epochs", cfg.get("warmup_epochs", 0)))
+    base_lr         = float(cfg_run.get("lr", cfg.get("lr", 0.001)))
+    warmup_start_lr = base_lr / 3.0  # More aggressive warmup start (was /10)
+    if warmup_epochs > 0:
+        # Set initial LR to warmup_start_lr
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = warmup_start_lr
+        print(f"  [{fold_label}] LR warmup enabled: {warmup_start_lr:.6f} → {base_lr:.6f} over {warmup_epochs} epochs")
     
     # SWA (Stochastic Weight Averaging) - helps escape local minima by averaging weights
     # from multiple points in the training trajectory, finding flatter minima that generalize better
@@ -596,15 +837,89 @@ def _train_one_fold(
         swa_scheduler = SWALR(optimizer, swa_lr=swa_lr)
         print(f"  [{fold_label}] SWA enabled: starts at epoch {swa_start_epoch}, swa_lr={swa_lr}")
 
+    # Collapse detection parameters
+    collapse_entropy_threshold = 0.3  # Below this entropy (bits), consider it collapse
+    collapse_lr_reduction = 0.5       # Reduce LR by this factor when collapse detected
+    collapse_detected_count = 0       # Track consecutive low-entropy epochs
+    collapse_patience = 3             # Consecutive low-entropy epochs before reducing LR
+    grad_norm_spike_threshold = 10.0  # Gradient norm above this triggers adaptive clipping
+    baseline_grad_norm = None         # Running average of gradient norms
+    adaptive_grad_clip = grad_clip    # May be reduced if gradients spike
+    collapse_recovery_count = 0       # How many times we've tried to recover
+    max_collapse_recoveries = 3       # Max recovery attempts before giving up
+    
+    # Diagnostic tracking
+    prev_bn_stats = None              # Track BatchNorm stats between epochs
+    f1_history = []                   # Track F1 for variance analysis
+    diagnostic_interval = 5           # Print diagnostics every N epochs
+    
     for epoch in range(1, num_epochs + 1):
-        loss = train_epoch(model, optimizer, criterion, train_loader, grad_clip=grad_clip, entropy_weight=entropy_weight)
+        # Learning rate warmup: linearly increase LR from warmup_start_lr to base_lr
+        if warmup_epochs > 0 and epoch <= warmup_epochs:
+            warmup_lr = warmup_start_lr + (base_lr - warmup_start_lr) * (epoch / warmup_epochs)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = warmup_lr
+        
+        train_stats = train_epoch(model, optimizer, criterion, train_loader, grad_clip=adaptive_grad_clip, entropy_weight=entropy_weight, classifier_l2=classifier_l2)
+        loss = train_stats['loss']
+        epoch_grad_norm = train_stats['grad_norm']
+        epoch_entropy = train_stats['entropy']
+        
+        # Update baseline gradient norm (exponential moving average)
+        if baseline_grad_norm is None:
+            baseline_grad_norm = epoch_grad_norm
+        else:
+            baseline_grad_norm = 0.9 * baseline_grad_norm + 0.1 * epoch_grad_norm
+        
+        # Gradient spike detection and adaptive clipping
+        if baseline_grad_norm > 0 and epoch_grad_norm > grad_norm_spike_threshold * baseline_grad_norm:
+            old_clip = adaptive_grad_clip if adaptive_grad_clip else float('inf')
+            adaptive_grad_clip = max(0.1, (adaptive_grad_clip or 1.0) * 0.5)
+            print(f"  [{fold_label}] ⚠️ Gradient spike detected (norm={epoch_grad_norm:.2f}, baseline={baseline_grad_norm:.2f}). "
+                  f"Reducing grad_clip: {old_clip:.2f} → {adaptive_grad_clip:.2f}")
+        
+        # Collapse detection based on entropy
+        if epoch_entropy < collapse_entropy_threshold:
+            collapse_detected_count += 1
+            if collapse_detected_count >= collapse_patience and collapse_recovery_count < max_collapse_recoveries:
+                # Reduce learning rate to recover from collapse
+                for param_group in optimizer.param_groups:
+                    old_lr = param_group['lr']
+                    param_group['lr'] = old_lr * collapse_lr_reduction
+                collapse_recovery_count += 1
+                print(f"  [{fold_label}] 🚨 COLLAPSE DETECTED (entropy={epoch_entropy:.3f} < {collapse_entropy_threshold}, "
+                      f"count={collapse_detected_count}). Reducing LR by {collapse_lr_reduction}x (recovery #{collapse_recovery_count})")
+                collapse_detected_count = 0  # Reset counter after intervention
+        else:
+            collapse_detected_count = max(0, collapse_detected_count - 1)  # Slowly recover counter
+        
         do_eval = (epoch % eval_interval == 0) or (epoch == num_epochs)
         if do_eval:
             preds, labels, probs = test_model(model, val_loader)
             acc = accuracy_score(labels, preds)
             f1  = f1_score(labels, preds, average="weighted")
+            f1_history.append(f1)  # Track for variance analysis
+            current_lr = optimizer.param_groups[0]['lr']
             print(f"  [{fold_label}] Epoch {epoch:03d}/{num_epochs} | "
-                  f"Loss: {loss:.4f} | Val Acc: {acc:.4f} | Val F1: {f1:.4f}")
+                  f"Loss: {loss:.4f} | Val Acc: {acc:.4f} | Val F1: {f1:.4f} | "
+                  f"LR: {current_lr:.6f} | Entropy: {epoch_entropy:.3f} | GradNorm: {epoch_grad_norm:.2f}")
+            
+            # Run diagnostics every N epochs or when performance drops significantly
+            run_diagnostics = (epoch % diagnostic_interval == 0) or \
+                             (len(f1_history) > 1 and f1 < f1_history[-2] - 0.1)
+            
+            if run_diagnostics:
+                # Get one validation snapshot for loss component analysis
+                val_snapshot = next(iter(val_loader))
+                
+                bn_diag = diagnose_batchnorm_stability(model, prev_bn_stats)
+                loss_diag = diagnose_loss_components(model, criterion, val_snapshot, entropy_weight)
+                f1_diag = diagnose_f1_variance(f1_history, window=5)
+                
+                print_diagnostics(epoch, bn_diag, loss_diag, f1_diag, fold_label)
+                
+                prev_bn_stats = bn_diag['stats']  # Save for next comparison
+            
             last_val_f1 = f1
             if f1 > best_f1 + min_delta:
                 best_f1          = f1
