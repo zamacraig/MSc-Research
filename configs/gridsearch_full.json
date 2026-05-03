@@ -1,0 +1,61 @@
+{
+  "_comment": "Comprehensive grid search to optimize TemporalGRU performance",
+  
+  "model_type": "temporal_gru",
+  
+  "hidden_channels": [24, 32, 48],
+  "gru_layers": [1, 2],
+  "gcn_layers": [2, 3],
+  
+  "dropout": [0.25, 0.35, 0.45],
+  
+  "lr": [0.001, 0.0005, 0.0003],
+  "weight_decay": [0.005, 0.01],
+  
+  "epochs": 100,
+  "in_channels": 12,
+  "num_classes": 3,
+  "train_ratio": 0.8,
+  "test_holdout_ratio": 0.2,
+  "seed": 42,
+  "device": "cpu",
+  "optimizer": "adam",
+  
+  "scheduler": {
+    "name": "CosineAnnealingLR",
+    "T_max": 100,
+    "eta_min": 0.00001
+  },
+  
+  "early_stopping_patience": 30,
+  "early_stopping_min_delta": 0.001,
+  "save_best": true,
+  "eval_interval": 1,
+  "run_name": "gridsearch",
+  
+  "data_path": "Dataset/TransientData/processedData.csv",
+  "save_dir": "src/masters_research/artifacts/models",
+  "plots_dir": "src/masters_research/artifacts/plots",
+  
+  "temporal_quality_audit": false,
+  "plot_nodes_per_timestamp": false,
+  
+  "seasonal_normalization": true,
+  "add_lag_features": false,
+  
+  "input_norm": true,
+  
+  "focal_loss": true,
+  "focal_gamma": [1.0, 2.0],
+  "label_smoothing": 0.0,
+  "entropy_reg": 0.01,
+  "classifier_l2": 0.001,
+  
+  "warmup_epochs": 10,
+  "grad_clip": 1.0,
+  
+  "n_cv_folds": 1,
+  "stratified_split": false,
+  
+  "enable_explainability": false
+}

@@ -94,7 +94,7 @@ def _create_targets(graph_df: pd.DataFrame) -> pd.DataFrame:
     # Target as mean of normalized features
     graph_df['Target'] = graph_df.drop(['Compno', 'TimeStamp'], axis=1).apply(lambda x: x.mean(), axis=1)
     # Quantile categories
-    graph_df['Quantile_Category'] = pd.qcut(graph_df['Target'], q=5, labels=['Very Low', 'Low', 'Medium', 'High', 'Very High'])
+    graph_df['Quantile_Category'] = pd.qcut(graph_df['Target'], q=3, labels=['Low', 'Medium', 'High'])
     # Encode
     le = LabelEncoder()
     graph_df['Category_encoded'] = le.fit_transform(graph_df['Quantile_Category'])
@@ -106,8 +106,7 @@ def _prepare_final_df(graph_df: pd.DataFrame) -> pd.DataFrame:
                          'AverageMaximumTemperature', 'AverageMinimunTemperature',
                          'AverageMaximumRelativeHumidity', 'AverageMinimumRelativeHumidity',
                          'TotalRainfall', 'AverageTotalRadiation', 'AverageWindSpeed',
-                         'AverageTotalRelativeEvaporation', 'Category_encoded']].copy()
-    final_df = final_df.rename(columns={'Category_encoded': 'Target'})
+                         'AverageTotalRelativeEvaporation', 'Target']].copy()
     final_df = final_df.sort_values(by=['Compno', 'TimeStamp'])
     return final_df
 
@@ -197,31 +196,94 @@ def main(base_path: Path | str | None = None):
     base_path = Path(base_path or Path(__file__).resolve().parents[3]).resolve()
 
     # Load and preprocess
+
+    from sklearn.pipeline import Pipeline
+    from sklearn.compose import ColumnTransformer
+    from sklearn.preprocessing import MinMaxScaler, FunctionTransformer
+    from sklearn.base import BaseEstimator, TransformerMixin
+    from sklearn.utils.validation import check_is_fitted
+    # --- Data loading and cleaning ---
     attribute_df, node_df = _load_original_dataset(base_path)
     attribute_df, node_df = _clean_and_prepare(attribute_df, node_df)
     graph_df = _build_graph_df(attribute_df, node_df)
-    graph_df = _create_targets(graph_df)
+    # Create 'Target' as mean of features (no normalization or binning here)
+    feature_cols_for_target = [
+        'Latitude', 'Longitude', 'Altitude',
+        'AverageMaximumTemperature', 'AverageMinimunTemperature',
+        'AverageMaximumRelativeHumidity', 'AverageMinimumRelativeHumidity',
+        'TotalRainfall', 'AverageTotalRadiation', 'AverageWindSpeed',
+        'AverageTotalRelativeEvaporation'
+    ]
+    graph_df['Target'] = graph_df[feature_cols_for_target].mean(axis=1)
     final_df = _prepare_final_df(graph_df)
     analysis_df = _add_time_shift_features(final_df)
-
-    # Features and labels
     analysis_df = analysis_df.dropna()
-    X = analysis_df.drop(columns=['Target', 'TimeStamp', 'Compno'])
-    y = analysis_df['Target']
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    # --- Custom target quantile binning transformer ---
+    class TargetQuantileBinner(BaseEstimator, TransformerMixin):
+        def __init__(self, n_bins=3, labels=None):
+            self.n_bins = n_bins
+            self.labels = list(range(self.n_bins))
+        def fit(self, y, *_):
+            import pandas as pd
+            self.bin_edges_ = pd.qcut(y, q=self.n_bins, retbins=True, labels=False, duplicates='drop')[1]
+            return self
+        def transform(self, y):
+            import pandas as pd
+            binned = pd.cut(y, bins=self.bin_edges_, labels=self.labels, include_lowest=True)
+            # Assign out-of-bounds to the lowest bin (can change to self.labels[-1] for upper outliers)
+            if self.labels[0] not in binned.cat.categories:
+                binned = binned.cat.add_categories([self.labels[0]])
+            binned = binned.fillna(self.labels[0])
+            return binned.astype(int).to_numpy()
 
-    # RandomForest GridSearch
+    # --- Prepare features and target ---
+    feature_cols = [
+        'Latitude', 'Longitude', 'Altitude',
+        'AverageMaximumTemperature', 'AverageMinimunTemperature',
+        'AverageMaximumRelativeHumidity', 'AverageMinimumRelativeHumidity',
+        'TotalRainfall', 'AverageTotalRadiation', 'AverageWindSpeed',
+        'AverageTotalRelativeEvaporation', 'Lag1_Target', 'Lag2_Target'
+    ]
+    X = analysis_df[feature_cols]
+    y_raw = analysis_df['Target']
+
+    # --- Split before any scaling or binning ---
+    X_train, X_test, y_train_raw, y_test_raw = train_test_split(X, y_raw, test_size=0.2, random_state=42)
+
+    # --- Fit quantile binning only on train ---
+    binner = TargetQuantileBinner(n_bins=3, labels=['Low', 'Medium', 'High'])
+    y_train = binner.fit_transform(y_train_raw)
+    y_test = binner.transform(y_test_raw)
+
+    # --- Pipeline for features ---
+    scaler = MinMaxScaler()
+    feature_pipeline = Pipeline([
+        ('scaler', scaler)
+    ])
+
+    # --- RandomForest GridSearch ---
     param_grid = {
         'n_estimators': [10, 25, 50, 100],
         'max_depth': [None, 10, 20, 30],
         'min_samples_split': [2, 5, 10],
         'min_samples_leaf': [1, 2, 4],
-        'max_features': ['auto', 'sqrt', 'log2']
+        'max_features': ['sqrt', 'log2']
     }
 
     rf = RandomForestClassifier(random_state=42)
-    grid_search = GridSearchCV(estimator=rf, param_grid=param_grid, cv=5, scoring='accuracy', verbose=1, n_jobs=-1)
+    pipeline = Pipeline([
+        ('preprocess', feature_pipeline),
+        ('clf', rf)
+    ])
+
+    grid_search = GridSearchCV(estimator=pipeline, param_grid={
+        'clf__n_estimators': param_grid['n_estimators'],
+        'clf__max_depth': param_grid['max_depth'],
+        'clf__min_samples_split': param_grid['min_samples_split'],
+        'clf__min_samples_leaf': param_grid['min_samples_leaf'],
+        'clf__max_features': param_grid['max_features'],
+    }, cv=5, scoring='accuracy', verbose=1, n_jobs=-1)
     grid_search.fit(X_train, y_train)
 
     best_model = grid_search.best_estimator_
@@ -241,10 +303,10 @@ def main(base_path: Path | str | None = None):
     joblib.dump(best_model, rf_model_path)
     # Save classification report (original text layout)
     cr_txt = out_dir_models / "RandomForest_classification_report.txt"
-    _save_classification_report_text(y_test.to_numpy(), y_pred_best, cr_txt)
+    _save_classification_report_text(y_test, y_pred_best, cr_txt)
     # Save confusion matrix plot
     cm_png = out_dir_models / "RandomForest_confusion_matrix.png"
-    _save_confusion_matrix_plot(y_test.to_numpy(), y_pred_best, cm_png)
+    _save_confusion_matrix_plot(y_test, y_pred_best, cm_png)
     print(f"Saved RF model to: {rf_model_path}")
     print(f"Saved RF classification report to: {cr_txt}")
     print(f"Saved RF confusion matrix plot to: {cm_png}")
@@ -303,9 +365,9 @@ def main(base_path: Path | str | None = None):
             keras_estimator_path = out_dir_models / "KerasClassifier.pkl"
             joblib.dump(best_keras, keras_estimator_path)
             keras_cr_txt = out_dir_models / "Keras_classification_report.txt"
-            _save_classification_report_text(y_test.to_numpy(), y_pred_keras, keras_cr_txt)
+            _save_classification_report_text(y_test, y_pred_keras, keras_cr_txt)
             keras_cm_png = out_dir_models / "Keras_confusion_matrix.png"
-            _save_confusion_matrix_plot(y_test.to_numpy(), y_pred_keras, keras_cm_png)
+            _save_confusion_matrix_plot(y_test, y_pred_keras, keras_cm_png)
             print(f"Saved Keras model to: {keras_model_path}")
             print(f"Saved Keras estimator to: {keras_estimator_path}")
             print(f"Saved Keras classification report to: {keras_cr_txt}")
@@ -346,9 +408,9 @@ def main(base_path: Path | str | None = None):
             keras_model_path = out_dir_models / "KerasClassifier.h5"
             keras_model.save(str(keras_model_path))
             keras_cr_txt = out_dir_models / "Keras_classification_report.txt"
-            _save_classification_report_text(y_test.to_numpy(), y_pred_keras, keras_cr_txt)
+            _save_classification_report_text(y_test, y_pred_keras, keras_cr_txt)
             keras_cm_png = out_dir_models / "Keras_confusion_matrix.png"
-            _save_confusion_matrix_plot(y_test.to_numpy(), y_pred_keras, keras_cm_png)
+            _save_confusion_matrix_plot(y_test, y_pred_keras, keras_cm_png)
             print(f"Saved Keras model to: {keras_model_path}")
             print(f"Saved Keras classification report to: {keras_cr_txt}")
             print(f"Saved Keras confusion matrix plot to: {keras_cm_png}")

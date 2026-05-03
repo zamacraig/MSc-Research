@@ -1,0 +1,61 @@
+{
+  "_comment": "Improved experiment: TemporalGRU with lag features + fixed TemporalAttention",
+  
+  "model_type": ["temporal_gru", "temporal_attention"],
+  
+  "epochs": 80,
+  "lr": [0.0005],
+  "weight_decay": 0.01,
+  "hidden_channels": 32,
+  "in_channels": 12,
+  "num_classes": 3,
+  "train_ratio": 0.8,
+  "test_holdout_ratio": 0.2,
+  "seed": 42,
+  "device": "cpu",
+  "optimizer": "adam",
+  
+  "scheduler": {
+    "name": "CosineAnnealingLR",
+    "T_max": 80,
+    "eta_min": 0.00001
+  },
+  
+  "early_stopping_patience": 25,
+  "early_stopping_min_delta": 0.001,
+  "save_best": true,
+  "eval_interval": 1,
+  "run_name": "improved",
+  
+  "data_path": "Dataset/TransientData/processedData.csv",
+  "save_dir": "src/masters_research/artifacts/models",
+  "plots_dir": "src/masters_research/artifacts/plots",
+  
+  "temporal_quality_audit": false,
+  "plot_nodes_per_timestamp": false,
+  
+  "seasonal_normalization": true,
+  "add_lag_features": true,
+  
+  "gcn_layers": 2,
+  "gru_layers": 1,
+  "dropout": 0.2,
+  "input_norm": true,
+  
+  "temporal_history_len": 10,
+  "temporal_heads": 2,
+  
+  "focal_loss": true,
+  "focal_gamma": 1.0,
+  "label_smoothing": 0.0,
+  "entropy_reg": 0.01,
+  "classifier_l2": 0.001,
+  
+  "warmup_epochs": 10,
+  "grad_clip": 1.0,
+  
+  "n_cv_folds": 1,
+  "stratified_split": false,
+  
+  "enable_explainability": false
+}

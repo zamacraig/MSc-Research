@@ -651,9 +651,20 @@ def _train_one_fold(
     val_loader   = TemporalDataLoader(val_dataset)
 
     # --- Model ---
+    # model_type takes precedence: "simple_gcn", "temporal_gru", "temporal_attention"
+    model_type = cfg_run.get("model_type", cfg.get("model_type", None))
     use_attention = bool(cfg_run.get("use_attention", cfg.get("use_attention", False)))
     use_temporal_attention = bool(cfg_run.get("use_temporal_attention", cfg.get("use_temporal_attention", False)))
     use_simple_gcn = bool(cfg_run.get("use_simple_gcn", cfg.get("use_simple_gcn", False)))
+    
+    # Override boolean flags if model_type is explicitly set
+    if model_type == "simple_gcn":
+        use_simple_gcn, use_temporal_attention = True, False
+    elif model_type == "temporal_gru":
+        use_simple_gcn, use_temporal_attention = False, False
+    elif model_type == "temporal_attention":
+        use_simple_gcn, use_temporal_attention = False, True
+    
     _gru_layers   = int(cfg_run.get("gru_layers",    cfg.get("gru_layers",    1)))
     _input_norm   = bool(cfg_run.get("input_norm",   cfg.get("input_norm",    True)))
     _in_channels  = int(cfg_run.get("in_channels", cfg.get("in_channels", 10)))
@@ -997,13 +1008,23 @@ def _train_one_fold(
     }
 
 
-def main(base_path: Path):
+def main(base_path: Path, config_path: Path = None):
     """
     Main function to run the training and evaluation pipeline.
-    Configuration is loaded from configs/default.json in the project root.
+    
+    Parameters
+    ----------
+    base_path : Path
+        Project root directory
+    config_path : Path, optional
+        Path to config JSON file. If None, defaults to configs/default.json
     """
     base_path = Path(base_path).resolve()
-    config_path = base_path / "configs" / "default.json"
+    if config_path is None:
+        config_path = base_path / "configs" / "default.json"
+    else:
+        config_path = Path(config_path).resolve()
+    print(f"Loading config from: {config_path}")
     cfg = load_config(config_path)
 
     try:
@@ -1130,7 +1151,12 @@ def main(base_path: Path):
         # Run grid of experiments
         for run_idx, cfg_run in enumerate(grid, start=1):
             run_prefix = cfg.get("run_name", "run")
-            run_id = f"{run_prefix}{run_idx}_{int(time.time())}"
+            # Include model_type in run_id for clarity
+            model_type_label = cfg_run.get("model_type", "")
+            if model_type_label:
+                run_id = f"{run_prefix}_{model_type_label}_{run_idx}_{int(time.time())}"
+            else:
+                run_id = f"{run_prefix}{run_idx}_{int(time.time())}"
             print(f"\n=== Starting grid run {run_idx}/{len(grid)} ({run_id}) ===")
 
             # Print resolved hyperparameters for this run

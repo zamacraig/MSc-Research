@@ -180,8 +180,10 @@ class TemporalAttentionGNN(nn.Module):
         # Classifier
         self.classifier = nn.Linear(hidden_channels, num_classes)
         
-        # History buffer (not a parameter, just storage)
-        self.register_buffer("_history", None, persistent=False)
+        # History storage (NOT a registered buffer to avoid SWA buffer misalignment)
+        # Using register_buffer causes issues with AveragedModel.update_parameters()
+        # because the buffer list changes size after forward passes
+        self._history = None
     
     def reset_history(self):
         """Clear the history buffer. Call at start of new sequence."""
