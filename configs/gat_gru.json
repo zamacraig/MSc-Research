@@ -1,0 +1,63 @@
+{
+  "model_type": "temporal_gru",
+  "use_attention": true,
+  "use_temporal_attention": false,
+  "use_simple_gcn": false,
+
+  "epochs": 80,
+  "lr": 0.0005,
+  "weight_decay": 0.01,
+  "hidden_channels": 64,
+  "in_channels": 12,
+  "num_classes": 3,
+  "train_ratio": 0.8,
+  "test_holdout_ratio": 0.2,
+  "seed": 42,
+  "device": "cpu",
+  "optimizer": "adam",
+
+  "scheduler": {
+    "name": "CosineAnnealingLR",
+    "T_max": 80,
+    "eta_min": 0.00001
+  },
+
+  "early_stopping_patience": 15,
+  "early_stopping_min_delta": 0.001,
+  "save_best": true,
+  "eval_interval": 1,
+  "run_name": "gat_gru",
+
+  "data_path": "Dataset/TransientData/processedData.csv",
+  "processed_data_path": "Dataset/TransientData/processedData.csv",
+  "save_dir": "src/masters_research/artifacts/models",
+  "plots_dir": "src/masters_research/artifacts/plots",
+
+  "use_attention": true,
+  "gat_heads": 4,
+  "gcn_layers": 3,
+  "gru_layers": 1,
+  "dropout": 0.3,
+  "input_norm": true,
+
+  "temporal_quality_audit": true,
+  "plot_nodes_per_timestamp": true,
+  "seasonal_normalization": true,
+  "add_lag_features": false,
+
+  "focal_loss": true,
+  "focal_gamma": 1.0,
+  "label_smoothing": 0.0,
+  "entropy_reg": 0.02,
+  "classifier_l2": 0.001,
+
+  "warmup_epochs": 5,
+  "grad_clip": 0.5,
+
+  "use_swa": false,
+  "swa_start_epoch": 20,
+  "swa_lr": 0.0005,
+
+  "n_cv_folds": 1,
+  "stratified_split": false
+}

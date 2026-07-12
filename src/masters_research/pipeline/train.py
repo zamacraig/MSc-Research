@@ -489,10 +489,16 @@ def _compute_and_save_detailed_metrics(run_id: str, labels: np.ndarray, preds: n
     precision, recall, f1_per_class, support = precision_recall_fscore_support(labels, preds, labels=classes, average=None, zero_division=0)
     f1_macro = f1_score(labels, preds, average='macro')
 
+    # Per-run subdirectories: CSVs under save_dir/{run_id}/, plots under plots_dir/{run_id}/
+    run_dir = save_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_plots_dir = plots_dir / run_id
+    run_plots_dir.mkdir(parents=True, exist_ok=True)
+
     # Confusion matrix
     cm = confusion_matrix(labels, preds, labels=classes)
-    cm_path_img = plots_dir / f"{run_id}_confusion_matrix.png"
-    cm_path_csv = save_dir / f"{run_id}_confusion_matrix.csv"
+    cm_path_img = run_plots_dir / f"{run_id}_confusion_matrix.png"
+    cm_path_csv = run_dir / f"{run_id}_confusion_matrix.csv"
     _save_confusion_matrix(cm, classes, cm_path_img)
     pd.DataFrame(cm, index=classes, columns=classes).to_csv(cm_path_csv, index_label='true\\pred')
 
@@ -504,15 +510,15 @@ def _compute_and_save_detailed_metrics(run_id: str, labels: np.ndarray, preds: n
         'f1': f1_per_class,
         'support': support,
     })
-    per_class_csv = save_dir / f"{run_id}_per_class_metrics.csv"
+    per_class_csv = run_dir / f"{run_id}_per_class_metrics.csv"
     per_class_df.to_csv(per_class_csv, index=False)
 
     # Per-class bar chart
-    per_class_plot = plots_dir / f"{run_id}_per_class_f1.png"
+    per_class_plot = run_plots_dir / f"{run_id}_per_class_f1.png"
     _save_per_class_bars(f1_per_class, classes, per_class_plot)
 
     # Per-run box-and-whisker plot of F1 across classes
-    per_run_box_plot = plots_dir / f"{run_id}_per_class_f1_box.png"
+    per_run_box_plot = run_plots_dir / f"{run_id}_per_class_f1_box.png"
     _save_per_run_boxplot(f1_per_class, per_run_box_plot)
 
     # ROC / AUC (One-vs-Rest) if possible
@@ -520,8 +526,8 @@ def _compute_and_save_detailed_metrics(run_id: str, labels: np.ndarray, preds: n
     try:
         y_true_bin = label_binarize(labels, classes=classes)
         roc_auc_macro = roc_auc_score(y_true_bin, probs, average='macro', multi_class='ovr')
-        roc_combined = plots_dir / f"{run_id}_roc_curves.png"
-        _save_roc_curves(labels, probs, classes, roc_combined, plots_dir)
+        roc_combined = run_plots_dir / f"{run_id}_roc_curves.png"
+        _save_roc_curves(labels, probs, classes, roc_combined, run_plots_dir)
     except Exception as e:
         print(f"Skipping ROC/AUC generation: {e}")
 
@@ -534,9 +540,9 @@ def _compute_and_save_detailed_metrics(run_id: str, labels: np.ndarray, preds: n
         'f1_macro': f1_macro,
         'roc_auc_macro_ovr': roc_auc_macro if roc_auc_macro is not None else '',
     }
-    summary_csv = save_dir / f"{run_id}_summary_metrics.csv"
+    summary_csv = run_dir / f"{run_id}_summary_metrics.csv"
     pd.DataFrame([summary]).to_csv(summary_csv, index=False)
-    print(f"Saved detailed metrics for {run_id} to {save_dir} and plots to {plots_dir}")
+    print(f"Saved detailed metrics for {run_id} to {run_dir} and plots to {run_plots_dir}")
 
 
 def _generate_summary_plots(results_csv: Path, plots_dir: Path):
@@ -990,8 +996,10 @@ def _train_one_fold(
     val_acc = float(accuracy_score(val_labels, val_preds))
     val_f1  = float(f1_score(val_labels, val_preds, average="weighted"))
 
-    # Persist full model state dict
-    model_save_path = save_dir / f"temporal_spatial_classifier_state_{fold_label}.pth"
+    # Persist full model state dict in a per-fold subfolder
+    fold_run_dir = save_dir / fold_label
+    fold_run_dir.mkdir(parents=True, exist_ok=True)
+    model_save_path = fold_run_dir / f"temporal_spatial_classifier_state_{fold_label}.pth"
     torch.save(model.state_dict(), model_save_path)
 
     return {
@@ -1069,7 +1077,11 @@ def main(base_path: Path, config_path: Path = None):
             print("\nGenerating plot of nodes per timestamp...")
             nodes_per_timestamp = final_df.groupby("TimeStamp")["Compno_x"].nunique()
             plt.figure(figsize=(15, 7))
-            nodes_per_timestamp.plot(kind="bar")
+            try:
+                nodes_per_timestamp.plot(kind="bar")
+            except Exception as e:
+                print(f"  Warning: pandas plotting backend unavailable ({e}). Falling back to matplotlib bar plot.")
+                plt.bar(nodes_per_timestamp.index.astype(str), nodes_per_timestamp.values)
             plt.title("Number of Nodes per Timestamp")
             plt.xlabel("Timestamp")
             plt.ylabel("Number of Nodes")

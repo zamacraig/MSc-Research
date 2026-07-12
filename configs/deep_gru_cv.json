@@ -57,5 +57,5 @@
   "n_cv_folds": 3,
   "stratified_split": false,
   
-  "enable_explainability": false
+  "enable_explainability": true
 }

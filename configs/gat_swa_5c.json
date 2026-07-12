@@ -23,7 +23,7 @@
   
   "epochs": 100,
   "in_channels": 12,
-  "num_classes": 5,
+  "num_classes": 3,
   "train_ratio": 0.8,
   "test_holdout_ratio": 0.2,
   "seed": 42,
@@ -66,5 +66,5 @@
   "n_cv_folds": 1,
   "stratified_split": false,
   
-  "enable_explainability": false
+  "enable_explainability": true
 }

@@ -8,7 +8,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.model_selection import GridSearchCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
 import joblib
@@ -168,7 +168,7 @@ def _save_classification_report_text(y_true: np.ndarray, y_pred: np.ndarray, out
     out_txt.write_text(report_str)
 
 
-def _save_confusion_matrix_plot(y_true: np.ndarray, y_pred: np.ndarray, out_png: Path) -> None:
+def _save_confusion_matrix_plot(y_true: np.ndarray, y_pred: np.ndarray, out_png: Path, model_name: str = "RandomForest Baseline") -> None:
     out_png.parent.mkdir(parents=True, exist_ok=True)
     classes = sorted(pd.Series(y_true).unique().tolist())
     cm = confusion_matrix(y_true, y_pred, labels=classes)
@@ -177,7 +177,7 @@ def _save_confusion_matrix_plot(y_true: np.ndarray, y_pred: np.ndarray, out_png:
     sns.heatmap(df_cm, annot=True, fmt="d", cmap="Blues")
     plt.xlabel("Predicted")
     plt.ylabel("True")
-    plt.title("Confusion Matrix - RandomForest Baseline")
+    plt.title(f"Confusion Matrix - {model_name}")
     plt.tight_layout()
     plt.savefig(out_png)
     plt.close()
@@ -248,8 +248,17 @@ def main(base_path: Path | str | None = None):
     X = analysis_df[feature_cols]
     y_raw = analysis_df['Target']
 
-    # --- Split before any scaling or binning ---
-    X_train, X_test, y_train_raw, y_test_raw = train_test_split(X, y_raw, test_size=0.2, random_state=42)
+    # --- Temporal split: first 80% of timestamps → train, remainder → test ---
+    # Mirrors GNN pipeline (temporal_signal_split) to ensure a fair comparison.
+    # Random splits leak future observations into training on time-series data.
+    sorted_timestamps = sorted(analysis_df['TimeStamp'].unique())
+    n_train_ts = int(len(sorted_timestamps) * 0.8)
+    train_ts = set(sorted_timestamps[:n_train_ts])
+    train_mask = analysis_df['TimeStamp'].isin(train_ts)
+    X_train, X_test = X[train_mask], X[~train_mask]
+    y_train_raw, y_test_raw = y_raw[train_mask], y_raw[~train_mask]
+    print(f"Temporal split: {n_train_ts} train timestamps / {len(sorted_timestamps) - n_train_ts} test timestamps "
+          f"({len(X_train)} / {len(X_test)} rows)")
 
     # --- Fit quantile binning only on train ---
     binner = TargetQuantileBinner(n_bins=3, labels=['Low', 'Medium', 'High'])
@@ -295,17 +304,14 @@ def main(base_path: Path | str | None = None):
     print("\nClassification Report with Best Model:")
     print(classification_report(y_test, y_pred_best))
 
-    # Outputs
-    out_dir_models = base_path / "src" / "masters_research" / "artifacts" / "models"
-    out_dir_models.mkdir(parents=True, exist_ok=True)
-    # Save model
-    rf_model_path = out_dir_models / "RandomForestClassifier.pkl"
+    # Outputs — each baseline gets its own subfolder
+    out_dir_rf = base_path / "src" / "masters_research" / "artifacts" / "models" / "RandomForest"
+    out_dir_rf.mkdir(parents=True, exist_ok=True)
+    rf_model_path = out_dir_rf / "RandomForestClassifier.pkl"
     joblib.dump(best_model, rf_model_path)
-    # Save classification report (original text layout)
-    cr_txt = out_dir_models / "RandomForest_classification_report.txt"
+    cr_txt = out_dir_rf / "RandomForest_classification_report.txt"
     _save_classification_report_text(y_test, y_pred_best, cr_txt)
-    # Save confusion matrix plot
-    cm_png = out_dir_models / "RandomForest_confusion_matrix.png"
+    cm_png = out_dir_rf / "RandomForest_confusion_matrix.png"
     _save_confusion_matrix_plot(y_test, y_pred_best, cm_png)
     print(f"Saved RF model to: {rf_model_path}")
     print(f"Saved RF classification report to: {cr_txt}")
@@ -314,15 +320,22 @@ def main(base_path: Path | str | None = None):
     # Optional: Keras baseline if TensorFlow available
     try:
         from tensorflow.keras.models import Sequential
-        from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
+        from tensorflow.keras.layers import Dense, Dropout, BatchNormalization, Input
         from tensorflow.keras.optimizers import Adam
         # Try SciKeras; fallback to direct Keras if incompatible
+        # Scale features for Keras (RF uses a pipeline; Keras needs pre-scaled input)
+        keras_scaler = MinMaxScaler()
+        X_train_scaled = keras_scaler.fit_transform(X_train)
+        X_test_scaled = keras_scaler.transform(X_test)
+        n_classes = len(np.unique(y_train))
+
         try:
             from scikeras.wrappers import KerasClassifier
 
             def create_model(learning_rate=0.001, activation='relu'):
                 model = Sequential([
-                    Dense(128, activation=activation, input_shape=(X_train.shape[1],)),
+                    Input(shape=(X_train_scaled.shape[1],)),
+                    Dense(128, activation=activation),
                     BatchNormalization(),
                     Dropout(0.3),
                     Dense(64, activation=activation),
@@ -334,40 +347,41 @@ def main(base_path: Path | str | None = None):
                     Dense(32, activation=activation),
                     BatchNormalization(),
                     Dropout(0.3),
-                    Dense(len(y.unique()), activation='softmax')
+                    Dense(n_classes, activation='softmax')
                 ])
                 model.compile(optimizer=Adam(learning_rate=learning_rate), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
                 return model
 
             keras_clf = KerasClassifier(model=create_model, verbose=0)
             param_grid_keras = {
-                'batch_size': [16, 32, 64],
-                'epochs': [120, 135, 150],
-                'model__learning_rate': [0.0025, 0.003, 0.0035],
-                'model__activation': ['relu', 'tanh', 'swish']
+                'batch_size': [32, 64],
+                'epochs': [100, 150],
+                'model__learning_rate': [0.001, 0.003],
+                'model__activation': ['relu', 'tanh']
             }
-            grid_keras = GridSearchCV(estimator=keras_clf, param_grid=param_grid_keras, cv=3, verbose=1, n_jobs=-1)
-            grid_keras_result = grid_keras.fit(X_train, y_train)
+            grid_keras = GridSearchCV(estimator=keras_clf, param_grid=param_grid_keras, cv=3, verbose=2, n_jobs=1)
+            grid_keras_result = grid_keras.fit(X_train_scaled, y_train)
             print(f"Keras Best Parameters: {grid_keras_result.best_params_}")
             print(f"Keras CV Best Score: {grid_keras_result.best_score_:.4f}")
 
             best_keras = grid_keras_result.best_estimator_
-            y_pred_keras = best_keras.predict(X_test)
+            y_pred_keras = best_keras.predict(X_test_scaled)
             keras_acc = accuracy_score(y_test, y_pred_keras)
             print(f"Test Accuracy (Keras Best): {keras_acc:.4f}")
             print("\nKeras Classification Report with Best Model:")
             print(classification_report(y_test, y_pred_keras))
 
-            # Save Keras model (h5) and estimator in artifacts/models
-            keras_model_path = out_dir_models / "KerasClassifier.h5"
-            keras_model_path.parent.mkdir(parents=True, exist_ok=True)
+            # Save Keras model (h5) and estimator in artifacts/models/Keras/
+            out_dir_keras = base_path / "src" / "masters_research" / "artifacts" / "models" / "Keras"
+            out_dir_keras.mkdir(parents=True, exist_ok=True)
+            keras_model_path = out_dir_keras / "KerasClassifier.keras"
             best_keras.model_.save(str(keras_model_path))
-            keras_estimator_path = out_dir_models / "KerasClassifier.pkl"
+            keras_estimator_path = out_dir_keras / "KerasClassifier.pkl"
             joblib.dump(best_keras, keras_estimator_path)
-            keras_cr_txt = out_dir_models / "Keras_classification_report.txt"
+            keras_cr_txt = out_dir_keras / "Keras_classification_report.txt"
             _save_classification_report_text(y_test, y_pred_keras, keras_cr_txt)
-            keras_cm_png = out_dir_models / "Keras_confusion_matrix.png"
-            _save_confusion_matrix_plot(y_test, y_pred_keras, keras_cm_png)
+            keras_cm_png = out_dir_keras / "Keras_confusion_matrix.png"
+            _save_confusion_matrix_plot(y_test, y_pred_keras, keras_cm_png, model_name="Keras Baseline")
             print(f"Saved Keras model to: {keras_model_path}")
             print(f"Saved Keras estimator to: {keras_estimator_path}")
             print(f"Saved Keras classification report to: {keras_cr_txt}")
@@ -377,7 +391,8 @@ def main(base_path: Path | str | None = None):
 
             def create_model(learning_rate=0.003, activation='relu'):
                 model = Sequential([
-                    Dense(128, activation=activation, input_shape=(X_train.shape[1],)),
+                    Input(shape=(X_train_scaled.shape[1],)),
+                    Dense(128, activation=activation),
                     BatchNormalization(),
                     Dropout(0.3),
                     Dense(64, activation=activation),
@@ -389,28 +404,29 @@ def main(base_path: Path | str | None = None):
                     Dense(32, activation=activation),
                     BatchNormalization(),
                     Dropout(0.3),
-                    Dense(len(y.unique()), activation='softmax')
+                    Dense(n_classes, activation='softmax')
                 ])
                 model.compile(optimizer=Adam(learning_rate=learning_rate), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
                 return model
 
             keras_model = create_model()
-            # Use reasonable defaults matching the grid
-            keras_model.fit(X_train, y_train, batch_size=32, epochs=135, verbose=0)
-            y_pred_probs = keras_model.predict(X_test, verbose=0)
+            keras_model.fit(X_train_scaled, y_train, batch_size=32, epochs=135, verbose=0)
+            y_pred_probs = keras_model.predict(X_test_scaled, verbose=0)
             y_pred_keras = np.argmax(y_pred_probs, axis=1)
             keras_acc = accuracy_score(y_test, y_pred_keras)
             print(f"Test Accuracy (Keras direct): {keras_acc:.4f}")
             print("\nKeras Classification Report (direct training):")
             print(classification_report(y_test, y_pred_keras))
 
-            # Save direct Keras model
-            keras_model_path = out_dir_models / "KerasClassifier.h5"
+            # Save direct Keras model in artifacts/models/Keras/
+            out_dir_keras = base_path / "src" / "masters_research" / "artifacts" / "models" / "Keras"
+            out_dir_keras.mkdir(parents=True, exist_ok=True)
+            keras_model_path = out_dir_keras / "KerasClassifier.keras"
             keras_model.save(str(keras_model_path))
-            keras_cr_txt = out_dir_models / "Keras_classification_report.txt"
+            keras_cr_txt = out_dir_keras / "Keras_classification_report.txt"
             _save_classification_report_text(y_test, y_pred_keras, keras_cr_txt)
-            keras_cm_png = out_dir_models / "Keras_confusion_matrix.png"
-            _save_confusion_matrix_plot(y_test, y_pred_keras, keras_cm_png)
+            keras_cm_png = out_dir_keras / "Keras_confusion_matrix.png"
+            _save_confusion_matrix_plot(y_test, y_pred_keras, keras_cm_png, model_name="Keras Baseline")
             print(f"Saved Keras model to: {keras_model_path}")
             print(f"Saved Keras classification report to: {keras_cr_txt}")
             print(f"Saved Keras confusion matrix plot to: {keras_cm_png}")

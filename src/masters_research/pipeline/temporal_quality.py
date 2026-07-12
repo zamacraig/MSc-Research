@@ -249,7 +249,15 @@ def _plot_label_drift(result: dict, plots_dir: Path):
     # Stacked area – class proportion over time
     ax = axes[0]
     df_plot = pd.DataFrame(dists, index=timestamps, columns=[f"Class {c}" for c in range(n_classes)])
-    df_plot.plot.area(ax=ax, colormap="tab10", alpha=0.8)
+    try:
+        df_plot.plot.area(ax=ax, colormap="tab10", alpha=0.8)
+    except Exception as e:
+        print(f"  Warning: pandas plotting backend unavailable ({e}). Falling back to matplotlib stackplot.")
+        x_vals = np.arange(len(timestamps))
+        colors = plt.cm.tab10(np.linspace(0, 1, n_classes))
+        ax.stackplot(x_vals, df_plot.T, colors=colors[:n_classes], alpha=0.8)
+        ax.set_xticks(x_vals)
+        ax.set_xticklabels([str(ts) for ts in timestamps], rotation=45, ha="right", fontsize=7)
     ax.set_title("Class Distribution Over Time (Label Drift)")
     ax.set_xlabel("Timestamp")
     ax.set_ylabel("Proportion")
@@ -295,7 +303,13 @@ def _plot_feature_drift(result: dict, plots_dir: Path):
 def _plot_coverage(result: dict, plots_dir: Path):
     coverage = result["per_timestamp"]
     fig, ax = plt.subplots(figsize=(14, 4))
-    coverage.plot(kind="bar", ax=ax, color="steelblue", alpha=0.8)
+    try:
+        coverage.plot(kind="bar", ax=ax, color="steelblue", alpha=0.8)
+    except Exception as e:
+        print(f"  Warning: pandas plotting backend unavailable ({e}). Falling back to matplotlib bar plot.")
+        ax.bar(range(len(coverage)), coverage.values, color="steelblue", alpha=0.8)
+        ax.set_xticks(range(len(coverage)))
+        ax.set_xticklabels([str(ts) for ts in coverage.index], rotation=45, ha="right", fontsize=6)
     ax.axhline(result["mean_coverage"], color="red", linestyle="--", label=f"Mean = {result['mean_coverage']:.3f}")
     ax.set_title("Node Coverage per Timestamp")
     ax.set_xlabel("Timestamp")

@@ -25,7 +25,7 @@
   "processed_data_path": "Dataset/TransientData/processedData.csv",
   "save_dir": "src/masters_research/artifacts/models",
   "plots_dir": "src/masters_research/artifacts/plots",
-  "enable_explainability": false,
+  "enable_explainability": true,
   "gnnexplainer_nodes": 5,
   "gnnexplainer_epochs": 100,
   "ig_nodes": 5,
