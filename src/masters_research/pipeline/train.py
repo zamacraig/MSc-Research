@@ -38,26 +38,92 @@ from masters_research.pipeline.temporal_quality import run_temporal_quality_audi
 import seaborn as sns
 
 
-class FocalLoss(nn.Module):
-    """Multi-class Focal Loss: down-weights easy examples so the model focuses on hard ones.
-    Useful when temporal distribution shift causes the test classes to differ from training.
-    gamma=0 reduces to standard cross-entropy.
-    
-    Added label_smoothing to prevent overconfident predictions that lead to mode collapse.
+def _model_type_from_cfg(cfg_run: dict) -> str:
+    """Map a run's hyperparameter flags to one of the 4 canonical model type names.
+
+    Mirrors the branch order in `_train_one_fold` so the folder layout matches the
+    architecture actually instantiated. Kept in sync with
+    pipeline/model_type_report.py::_classify_run.
     """
-    def __init__(self, gamma: float = 2.0, weight: torch.Tensor | None = None, label_smoothing: float = 0.0):
+    model_type = cfg_run.get("model_type")
+    if model_type == "simple_gcn" or bool(cfg_run.get("use_simple_gcn", False)):
+        return "SimpleGCN"
+    if model_type == "temporal_attention" or bool(cfg_run.get("use_temporal_attention", False)):
+        return "TemporalAttentionGNN"
+    if bool(cfg_run.get("use_attention", False)):
+        return "TemporalGAT_GRU"
+    return "TemporalGCN_GRU"
+
+
+class FocalLoss(nn.Module):
+    """Multi-class Focal Loss with optional logit adjustment and ordinal penalty.
+
+    Base loss: standard focal cross-entropy (gamma=0 reduces to CE) with class weights
+    and label smoothing — designed for imbalanced / mode-collapsing regimes.
+
+    Optional additions (both off by default; enable via config):
+
+    * `logit_adjustment` (Menon et al. 2020, "Long-tail learning via logit adjustment"):
+      When `log_prior` is provided, the model's raw logits are shifted by
+      `log_prior` before the softmax used inside the CE. This teaches the network
+      to output *balanced* posteriors regardless of the training prior, correcting
+      for temporal drift between train/val/test class frequencies. At inference
+      the raw (un-adjusted) logits are used, giving a properly calibrated classifier.
+
+    * `ordinal_lambda > 0`: adds an expected-ordinal-distance penalty
+      `E_p[|c - y|]` on top of the focal CE. For an ordered target (low < med < high)
+      this penalises "predicted 0 when true is 2" more than "predicted 1 when true is 2",
+      so the model respects the class ordering during optimisation.
+    """
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        weight: torch.Tensor | None = None,
+        label_smoothing: float = 0.0,
+        log_prior: torch.Tensor | None = None,
+        ordinal_lambda: float = 0.0,
+    ):
         super().__init__()
         self.gamma = gamma
         self.weight = weight
         self.label_smoothing = label_smoothing
+        # register_buffer keeps the tensor on the same device as the module and
+        # excludes it from parameters(). Store None too for the "off" case.
+        if log_prior is not None:
+            self.register_buffer("log_prior", log_prior.detach().clone())
+        else:
+            self.log_prior = None
+        self.ordinal_lambda = ordinal_lambda
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Logit adjustment: shift logits by log P(y=c) so the CE optimises the
+        # balanced posterior. Raw `inputs` are still returned upstream for
+        # inference / metric computation.
+        if self.log_prior is not None:
+            adj_inputs = inputs + self.log_prior.to(inputs.device).unsqueeze(0)
+        else:
+            adj_inputs = inputs
+
         ce = nn.functional.cross_entropy(
-            inputs, targets, weight=self.weight, reduction='none',
+            adj_inputs, targets, weight=self.weight, reduction='none',
             label_smoothing=self.label_smoothing
         )
         pt = torch.exp(-ce)
-        return (((1.0 - pt) ** self.gamma) * ce).mean()
+        focal = ((1.0 - pt) ** self.gamma) * ce
+        loss = focal.mean()
+
+        if self.ordinal_lambda > 0.0:
+            # Expected ordinal distance from the true class under the (adjusted) softmax.
+            # For each sample, sum_c |c - y| * P(c | x).  Uses adj_inputs so the penalty
+            # is computed on the same distribution the CE is minimising.
+            probs = torch.softmax(adj_inputs, dim=-1)
+            num_classes = probs.size(-1)
+            class_ids = torch.arange(num_classes, device=probs.device, dtype=probs.dtype)
+            dist = (class_ids.unsqueeze(0) - targets.unsqueeze(1).to(probs.dtype)).abs()
+            expected_dist = (probs * dist).sum(dim=-1).mean()
+            loss = loss + self.ordinal_lambda * expected_dist
+
+        return loss
 
 
 def entropy_regularization(logits: torch.Tensor) -> torch.Tensor:
@@ -481,7 +547,7 @@ def _save_roc_curves(y_true: np.ndarray, y_prob: np.ndarray, classes: list, out_
     plt.savefig(out_path_combined)
     plt.close()
 
-def _compute_and_save_detailed_metrics(run_id: str, labels: np.ndarray, preds: np.ndarray, probs: np.ndarray, num_classes: int, save_dir: Path, plots_dir: Path):
+def _compute_and_save_detailed_metrics(run_id: str, labels: np.ndarray, preds: np.ndarray, probs: np.ndarray, num_classes: int, run_dir: Path, run_plots_dir: Path):
     classes = list(range(num_classes))
     # Core metrics
     acc = accuracy_score(labels, preds)
@@ -489,10 +555,9 @@ def _compute_and_save_detailed_metrics(run_id: str, labels: np.ndarray, preds: n
     precision, recall, f1_per_class, support = precision_recall_fscore_support(labels, preds, labels=classes, average=None, zero_division=0)
     f1_macro = f1_score(labels, preds, average='macro')
 
-    # Per-run subdirectories: CSVs under save_dir/{run_id}/, plots under plots_dir/{run_id}/
-    run_dir = save_dir / run_id
+    # Per-run directories are supplied by the caller and already scoped by model type
+    # (e.g. save_dir/<model_type>/<run_id>/ and plots_dir/<model_type>/<run_id>/).
     run_dir.mkdir(parents=True, exist_ok=True)
-    run_plots_dir = plots_dir / run_id
     run_plots_dir.mkdir(parents=True, exist_ok=True)
 
     # Confusion matrix
@@ -604,9 +669,10 @@ def _generate_summary_plots(results_csv: Path, plots_dir: Path):
 
     # 3) Box-and-whisker of per-class F1 across runs
     try:
-        # Collect per-class metrics from all runs
+        # Collect per-class metrics from all runs. With the models/<model_type>/<run_id>/
+        # layout, per-class CSVs live several levels deep — use rglob.
         models_dir = plots_dir.parent / 'models' if plots_dir.parent.name == 'artifacts' else plots_dir.parent
-        per_class_files = list(models_dir.glob('*_per_class_metrics.csv'))
+        per_class_files = list(models_dir.rglob('*_per_class_metrics.csv'))
         if per_class_files:
             all_rows = []
             for f in per_class_files:
@@ -635,6 +701,27 @@ def _generate_summary_plots(results_csv: Path, plots_dir: Path):
         print(f"Failed to generate per-class F1 boxplot across runs: {e}")
 
 
+def _dataset_class_counts(dataset, num_classes: int) -> np.ndarray:
+    """Collect class counts across every snapshot in a temporal dataset.
+
+    Used by the class_weight_source machinery so we can compute inverse-frequency
+    weights (or priors for logit adjustment) from an arbitrary dataset — the fold's
+    train split, the outer trainval pool, or the full dataset — rather than being
+    locked to the train fold.
+    """
+    all_labels = []
+    n = getattr(dataset, "snapshot_count", None) or len(dataset)
+    for i in range(n):
+        y = dataset[i].y
+        if isinstance(y, torch.Tensor):
+            y = y.cpu().numpy()
+        all_labels.append(np.asarray(y).astype(int))
+    if not all_labels:
+        return np.zeros(num_classes, dtype=float)
+    concat = np.concatenate(all_labels)
+    return np.bincount(concat, minlength=num_classes).astype(float)
+
+
 def _train_one_fold(
     fold_label: str,
     train_dataset,
@@ -642,8 +729,9 @@ def _train_one_fold(
     cfg_run: dict,
     cfg: dict,
     device,
-    save_dir: Path,
+    run_models_dir: Path,
     num_classes_run: int,
+    trainval_dataset=None,
 ) -> dict:
     """
     Create a fresh model, run the training loop with early stopping, reload the best
@@ -694,7 +782,18 @@ def _train_one_fold(
         from masters_research.models.temporal_attention_gnn import TemporalAttentionGNN
         _history_len = int(cfg_run.get("temporal_history_len", cfg.get("temporal_history_len", 10)))
         _temporal_heads = int(cfg_run.get("temporal_heads", cfg.get("temporal_heads", 4)))
-        print(f"  [{fold_label}] Using TemporalAttentionGNN (history_len={_history_len}, heads={_temporal_heads}, dropout={_dropout})")
+        # Attention-specific stability knobs. attention_gate_init=0 (ReZero) is the
+        # default because it fixes the class-0<->class-2 sign-flip we observed
+        # across seeds. attention_dropout defaults to the network's dropout if
+        # unset; overriding lets you regularise the attention layer more heavily
+        # than the rest of the model.
+        _attn_gate_init = float(cfg_run.get("attention_gate_init", cfg.get("attention_gate_init", 0.0)))
+        _attn_dropout_cfg = cfg_run.get("attention_dropout", cfg.get("attention_dropout", None))
+        _attn_dropout = float(_attn_dropout_cfg) if _attn_dropout_cfg is not None else None
+        print(f"  [{fold_label}] Using TemporalAttentionGNN "
+              f"(history_len={_history_len}, heads={_temporal_heads}, "
+              f"dropout={_dropout}, attn_dropout={_attn_dropout}, "
+              f"attn_gate_init={_attn_gate_init})")
         model = TemporalAttentionGNN(
             in_channels=_in_channels,
             hidden_channels=_hidden_channels,
@@ -706,6 +805,8 @@ def _train_one_fold(
             input_norm=_input_norm,
             use_gat=use_attention,
             gat_heads=int(cfg_run.get("gat_heads", cfg.get("gat_heads", 4))),
+            attention_dropout=_attn_dropout,
+            attention_gate_init=_attn_gate_init,
         ).to(device)
     elif use_attention:
         try:
@@ -755,16 +856,44 @@ def _train_one_fold(
             weight_decay=float(cfg_run.get("weight_decay", cfg.get("weight_decay", 5e-4))),
         )
 
-    # --- Class weights (inverse-frequency from training snapshots) ---
-    _train_lbls = np.concatenate([
-        train_dataset[i].y.cpu().numpy().astype(int)
-        for i in range(getattr(train_dataset, "snapshot_count", None) or len(train_dataset))
-    ])
-    _counts = np.bincount(_train_lbls, minlength=num_classes_run).astype(float)
+    # --- Class weights (source configurable via class_weight_source) ---
+    # "train"    → weights from this fold's train split (legacy default).
+    # "trainval" → weights from the outer trainval pool if available. Preferred when
+    #              per-fold inner splits show large class-prior drift (val≠train),
+    #              since the trainval pool's distribution is more representative of
+    #              the eventual test-time prior.
+    # "uniform"  → equal weights (i.e. no reweighting). Useful when combined with
+    #              logit_adjustment, which corrects for prior shift directly.
+    weight_source = str(cfg_run.get("class_weight_source", cfg.get("class_weight_source", "train"))).lower()
+    if weight_source == "trainval" and trainval_dataset is not None:
+        source_ds = trainval_dataset
+    elif weight_source == "uniform":
+        source_ds = None
+    else:
+        source_ds = train_dataset
+
+    if source_ds is None:
+        _counts = np.ones(num_classes_run, dtype=float)
+    else:
+        _counts = _dataset_class_counts(source_ds, num_classes_run)
     _w = 1.0 / np.maximum(_counts, 1)
     _w = (_w / _w.sum()) * num_classes_run
     class_weights = torch.tensor(_w, dtype=torch.float).to(device)
-    print(f"  [{fold_label}] Class weights: {[f'{v:.3f}' for v in _w]}")
+    print(f"  [{fold_label}] Class weights (source={weight_source}): {[f'{v:.3f}' for v in _w]}")
+
+    # --- Logit adjustment prior (Menon et al. 2020) ---
+    # If enabled, we shift training-time logits by log(P(y=c)) so the CE optimises
+    # the *balanced* posterior. Prior is estimated from the same dataset chosen
+    # for class weights (usually train or trainval).
+    use_logit_adjustment = bool(cfg_run.get("logit_adjustment", cfg.get("logit_adjustment", False)))
+    log_prior_tensor = None
+    if use_logit_adjustment:
+        prior_ds = source_ds if source_ds is not None else train_dataset
+        prior_counts = _dataset_class_counts(prior_ds, num_classes_run)
+        prior_counts = np.maximum(prior_counts, 1)  # avoid log(0)
+        prior = prior_counts / prior_counts.sum()
+        log_prior_tensor = torch.tensor(np.log(prior), dtype=torch.float, device=device)
+        print(f"  [{fold_label}] Logit adjustment enabled — log-prior: {[f'{v:.3f}' for v in np.log(prior)]}")
 
     # --- Loss function ---
     use_focal   = bool(cfg_run.get("focal_loss",  cfg.get("focal_loss",  True)))
@@ -772,10 +901,30 @@ def _train_one_fold(
     label_smoothing = float(cfg_run.get("label_smoothing", cfg.get("label_smoothing", 0.0)))
     entropy_weight = float(cfg_run.get("entropy_reg", cfg.get("entropy_reg", 0.0)))
     classifier_l2 = float(cfg_run.get("classifier_l2", cfg.get("classifier_l2", 0.0)))
-    
-    if use_focal:
-        criterion = FocalLoss(gamma=focal_gamma, weight=class_weights, label_smoothing=label_smoothing)
-        print(f"  [{fold_label}] Using Focal Loss (gamma={focal_gamma}, label_smoothing={label_smoothing})")
+    use_ordinal = bool(cfg_run.get("ordinal_loss", cfg.get("ordinal_loss", False)))
+    ordinal_lambda = float(cfg_run.get("ordinal_lambda", cfg.get("ordinal_lambda", 0.5))) if use_ordinal else 0.0
+
+    if use_focal or use_ordinal or use_logit_adjustment:
+        # FocalLoss now carries both logit adjustment and the ordinal penalty, so
+        # we take this branch whenever any of the three is on. gamma=0 recovers CE
+        # when the caller opted in for adjustment/ordinal only.
+        effective_gamma = focal_gamma if use_focal else 0.0
+        criterion = FocalLoss(
+            gamma=effective_gamma,
+            weight=class_weights,
+            label_smoothing=label_smoothing,
+            log_prior=log_prior_tensor,
+            ordinal_lambda=ordinal_lambda,
+        )
+        active = []
+        if use_focal:
+            active.append(f"focal(gamma={effective_gamma})")
+        if use_logit_adjustment:
+            active.append("logit_adjustment")
+        if use_ordinal:
+            active.append(f"ordinal(lambda={ordinal_lambda})")
+        print(f"  [{fold_label}] Loss = FocalLoss[{', '.join(active) or 'ce'}] "
+              f"label_smoothing={label_smoothing}")
     else:
         criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
         print(f"  [{fold_label}] Using weighted CrossEntropyLoss (label_smoothing={label_smoothing})")
@@ -942,7 +1091,8 @@ def _train_one_fold(
                 best_f1          = f1
                 patience_counter = 0
                 if cfg_run.get("save_best", cfg.get("save_best", True)):
-                    best_model_path = save_dir / f"best_{fold_label}.pth"
+                    run_models_dir.mkdir(parents=True, exist_ok=True)
+                    best_model_path = run_models_dir / f"best_{fold_label}.pth"
                     torch.save(model.state_dict(), best_model_path)
             else:
                 patience_counter += 1
@@ -996,8 +1146,8 @@ def _train_one_fold(
     val_acc = float(accuracy_score(val_labels, val_preds))
     val_f1  = float(f1_score(val_labels, val_preds, average="weighted"))
 
-    # Persist full model state dict in a per-fold subfolder
-    fold_run_dir = save_dir / fold_label
+    # Persist full model state dict in a per-fold subfolder under the per-run models dir
+    fold_run_dir = run_models_dir / fold_label
     fold_run_dir.mkdir(parents=True, exist_ok=True)
     model_save_path = fold_run_dir / f"temporal_spatial_classifier_state_{fold_label}.pth"
     torch.save(model.state_dict(), model_save_path)
@@ -1052,6 +1202,7 @@ def main(base_path: Path, config_path: Path = None):
         results_path = save_dir / "grid_results.csv"
         header = [
             "run_id",
+            "model_type",
             "params",
             "val_accuracy",
             "val_f1",
@@ -1059,6 +1210,8 @@ def main(base_path: Path, config_path: Path = None):
             "final_test_f1",
             "model_path",
             "best_model_path",
+            "run_models_dir",
+            "run_plots_dir",
             "best_f1",
             "duration_seconds",
         ]
@@ -1121,6 +1274,11 @@ def main(base_path: Path, config_path: Path = None):
         if cfg.get("in_channels") != actual_in_channels:
             print(f"  Updating in_channels from config value {cfg.get('in_channels')} → {actual_in_channels}")
             cfg["in_channels"] = actual_in_channels
+        # Propagate the detected value into every pre-built grid entry: generate_param_grid
+        # snapshotted cfg *before* this dynamic detection, so each cfg_run still holds the
+        # stale value that would build a BatchNorm/GCN of the wrong width.
+        for cfg_run in grid:
+            cfg_run["in_channels"] = actual_in_channels
         
         print("\n" + "=" * 50)
         print(" " * 18 + "DATASET INFO")
@@ -1163,13 +1321,25 @@ def main(base_path: Path, config_path: Path = None):
         # Run grid of experiments
         for run_idx, cfg_run in enumerate(grid, start=1):
             run_prefix = cfg.get("run_name", "run")
+            # Canonical architecture name determines the folder layout for this run.
+            model_type_name = _model_type_from_cfg(cfg_run)
             # Include model_type in run_id for clarity
             model_type_label = cfg_run.get("model_type", "")
             if model_type_label:
                 run_id = f"{run_prefix}_{model_type_label}_{run_idx}_{int(time.time())}"
             else:
                 run_id = f"{run_prefix}{run_idx}_{int(time.time())}"
+
+            # Per-run directories: models/<model_type>/<run_id>/ and plots/<model_type>/<run_id>/
+            run_models_dir = save_dir / model_type_name / run_id
+            run_plots_dir = plots_dir / model_type_name / run_id
+            run_models_dir.mkdir(parents=True, exist_ok=True)
+            run_plots_dir.mkdir(parents=True, exist_ok=True)
+
             print(f"\n=== Starting grid run {run_idx}/{len(grid)} ({run_id}) ===")
+            print(f"    Model type: {model_type_name}")
+            print(f"    Models dir: {run_models_dir}")
+            print(f"    Plots dir:  {run_plots_dir}")
 
             # Print resolved hyperparameters for this run
             print("Run configuration:")
@@ -1215,7 +1385,7 @@ def main(base_path: Path, config_path: Path = None):
                         name_a=f"Train ({run_id})",
                         name_b=f"Val ({run_id})",
                         num_classes=num_classes_run,
-                        plots_dir=plots_dir,
+                        plots_dir=run_plots_dir,
                         plot_prefix=f"inner_split_{run_id}",
                     )
             else:
@@ -1254,7 +1424,8 @@ def main(base_path: Path, config_path: Path = None):
                     _print_class_balance_for_dataset(f"Fold {fold_num} val",   fold_val,   num_classes=num_classes_run)
                     result = _train_one_fold(
                         fold_id, fold_train, fold_val,
-                        cfg_run, cfg, device, save_dir, num_classes_run,
+                        cfg_run, cfg, device, run_models_dir, num_classes_run,
+                        trainval_dataset=trainval_dataset,
                     )
                     fold_results.append(result)
                     fold_val_datasets.append(fold_val)
@@ -1294,7 +1465,8 @@ def main(base_path: Path, config_path: Path = None):
                 # ---- Single inner split (original behaviour) ----
                 result = _train_one_fold(
                     run_id, train_dataset, val_dataset,
-                    cfg_run, cfg, device, save_dir, num_classes_run,
+                    cfg_run, cfg, device, run_models_dir, num_classes_run,
+                    trainval_dataset=trainval_dataset,
                 )
                 model           = result["model"]
                 final_acc       = result["val_acc"]
@@ -1325,6 +1497,7 @@ def main(base_path: Path, config_path: Path = None):
             # Append results to CSV
             row = {
                 "run_id": run_id,
+                "model_type": model_type_name,
                 "params": json.dumps(cfg_run),
                 "val_accuracy": final_acc,
                 "val_f1": final_f1,
@@ -1332,13 +1505,31 @@ def main(base_path: Path, config_path: Path = None):
                 "final_test_f1": ht_f1,
                 "model_path": str(model_save_path),
                 "best_model_path": str(best_model_path) if best_model_path else "",
+                "run_models_dir": str(run_models_dir),
+                "run_plots_dir": str(run_plots_dir),
                 "best_f1": best_f1 if best_f1 >= 0 else final_f1,
                 "duration_seconds": round(duration, 3),
             }
+            import csv
+            # Schema check: if an existing grid_results.csv has a different header
+            # (from before the model_type / run_models_dir / run_plots_dir columns
+            # were added), rotate it aside and start fresh so column order stays
+            # consistent for every row in the active file.
+            if results_path.exists():
+                try:
+                    with results_path.open("r", newline="") as _f:
+                        existing_header = next(csv.reader(_f), [])
+                except Exception:
+                    existing_header = []
+                if existing_header != header:
+                    backup = results_path.with_name(
+                        f"{results_path.stem}_legacy_{int(time.time())}.csv"
+                    )
+                    results_path.rename(backup)
+                    print(f"grid_results.csv header changed; archived old file to {backup}")
+
             write_header = not results_path.exists()
             with results_path.open("a", newline="") as csvfile:
-                import csv
-
                 writer = csv.DictWriter(csvfile, fieldnames=header)
                 if write_header:
                     writer.writeheader()
@@ -1352,8 +1543,8 @@ def main(base_path: Path, config_path: Path = None):
                 preds=final_preds,
                 probs=final_probs,
                 num_classes=int(cfg_run.get("num_classes", cfg.get("num_classes", 5))),
-                save_dir=save_dir,
-                plots_dir=plots_dir,
+                run_dir=run_models_dir,
+                run_plots_dir=run_plots_dir,
             )
 
             # === Explainability: GNNExplainer (local subgraph) ===
@@ -1364,18 +1555,10 @@ def main(base_path: Path, config_path: Path = None):
                     test_snapshot = val_dataset[0]
                     num_nodes = test_snapshot.x.shape[0]
                     # Feature names for readability in plots (must match dataset feature order)
-                    feature_names = [
-                        "AverageMaximumTemperature_x",
-                        "AverageMinimunTemperature_x",
-                        "AverageMaximumRelativeHumidity_x",
-                        "AverageMinimumRelativeHumidity_x",
-                        "TotalRainfall_x",
-                        "AverageTotalRadiation_x",
-                        "AverageWindSpeed_x",
-                        "AverageTotalRelativeEvaporation_x",
-                        "month_sin",
-                        "month_cos",
-                    ]
+                    # Real feature names attached by create_temporal_dataset — covers
+                    # base + lag/roll/diff + Fourier features, so labels stay accurate
+                    # even when add_lag_features is toggled.
+                    feature_names = list(getattr(dataset, "feature_names", []) or [])
                     # Determine edge weight tensor attribute name across library versions
                     edge_weight_src = getattr(test_snapshot, 'edge_weight', None)
                     if edge_weight_src is None:
@@ -1392,6 +1575,11 @@ def main(base_path: Path, config_path: Path = None):
                         # Use explicit multiclass classification mode to match torch_geometric 2.6.x
                         model_config=ModelConfig(mode='multiclass_classification', task_level='node', return_type='log_probs')
                     )
+                    # Collect raw arrays across all explained nodes so
+                    # explainability_report.py can produce model-level aggregates
+                    # spanning every run of a given architecture.
+                    _feat_masks_this_run: list[np.ndarray] = []
+                    _edge_masks_this_run: list[np.ndarray] = []
                     for idx in node_indices:
                         explanation = explainer(
                             x=test_snapshot.x,
@@ -1417,6 +1605,7 @@ def main(base_path: Path, config_path: Path = None):
                             # If mask is multi-dim, reduce to per-feature (e.g., mean across nodes)
                             if mask_np.ndim > 1:
                                 mask_np = mask_np.mean(axis=0)
+                            _feat_masks_this_run.append(mask_np)
                             plt.figure(figsize=(10,4))
                             # Use feature names if available and lengths match
                             x_labels = feature_names if len(feature_names) == len(mask_np) else list(range(len(mask_np)))
@@ -1427,22 +1616,45 @@ def main(base_path: Path, config_path: Path = None):
                             if x_labels is feature_names:
                                 plt.xticks(rotation=45, ha='right')
                             plt.tight_layout()
-                            out_path = plots_dir / f"{run_id}_gnnexplainer_node_{idx}_feature_importance.png"
+                            out_path = run_plots_dir / f"{run_id}_gnnexplainer_node_{idx}_feature_importance.png"
                             plt.savefig(out_path)
                             plt.close()
 
                         # Edge importance histogram
                         if edge_mask is not None:
                             edge_np = edge_mask.detach().cpu().numpy()
+                            _edge_masks_this_run.append(edge_np)
                             plt.figure(figsize=(8,4))
                             sns.histplot(edge_np, bins=20)
                             plt.xlabel('Edge mask value')
                             plt.ylabel('Count')
                             plt.title(f'GNNExplainer Edge Mask Distribution (node {idx})')
                             plt.tight_layout()
-                            out_path = plots_dir / f"{run_id}_gnnexplainer_node_{idx}_edge_mask_hist.png"
+                            out_path = run_plots_dir / f"{run_id}_gnnexplainer_node_{idx}_edge_mask_hist.png"
                             plt.savefig(out_path)
                             plt.close()
+
+                    # Persist stacked raw arrays for cross-run aggregation.
+                    # feature_masks: (num_explained_nodes, num_features)
+                    # edge_masks:    (num_explained_nodes, num_edges) — may be ragged
+                    #                if edge count varies per snapshot; save as
+                    #                object array to preserve shape.
+                    if _feat_masks_this_run:
+                        try:
+                            feat_stack = np.stack(_feat_masks_this_run, axis=0)
+                        except ValueError:
+                            # Ragged shapes fall back to object array so we don't crash.
+                            feat_stack = np.array(_feat_masks_this_run, dtype=object)
+                        edge_stack = (
+                            np.array(_edge_masks_this_run, dtype=object)
+                            if _edge_masks_this_run else np.array([], dtype=object)
+                        )
+                        np.savez(
+                            run_models_dir / "explainability_gnnexplainer.npz",
+                            feature_masks=feat_stack,
+                            edge_masks=edge_stack,
+                            feature_names=np.array(feature_names, dtype=object),
+                        )
                 except Exception as e:
                     print(f"GNNExplainer generation failed: {e}")
 
@@ -1452,18 +1664,10 @@ def main(base_path: Path, config_path: Path = None):
                 try:
                     test_snapshot = val_dataset[0]
                     # Feature names for readability in plots (must match dataset feature order)
-                    feature_names = [
-                        "AverageMaximumTemperature_x",
-                        "AverageMinimunTemperature_x",
-                        "AverageMaximumRelativeHumidity_x",
-                        "AverageMinimumRelativeHumidity_x",
-                        "TotalRainfall_x",
-                        "AverageTotalRadiation_x",
-                        "AverageWindSpeed_x",
-                        "AverageTotalRelativeEvaporation_x",
-                        "month_sin",
-                        "month_cos",
-                    ]
+                    # Real feature names attached by create_temporal_dataset — covers
+                    # base + lag/roll/diff + Fourier features, so labels stay accurate
+                    # even when add_lag_features is toggled.
+                    feature_names = list(getattr(dataset, "feature_names", []) or [])
                     # Determine edge weight tensor attribute name across library versions
                     edge_weight_src = getattr(test_snapshot, 'edge_weight', None)
                     if edge_weight_src is None:
@@ -1493,8 +1697,10 @@ def main(base_path: Path, config_path: Path = None):
                             per_class_attr[cls].append(attr_vec)
 
                     # Aggregate per-class attributions
+                    all_class_arrays: list[np.ndarray] = []
                     for cls, vecs in per_class_attr.items():
                         arr = np.stack(vecs, axis=0)
+                        all_class_arrays.append(arr)
                         mean_attr = arr.mean(axis=0)
                         # Save bar
                         plt.figure(figsize=(10,4))
@@ -1506,7 +1712,7 @@ def main(base_path: Path, config_path: Path = None):
                         if x_labels is feature_names:
                             plt.xticks(rotation=45, ha='right')
                         plt.tight_layout()
-                        out_path = plots_dir / f"{run_id}_ig_class_{cls}_mean_attr.png"
+                        out_path = run_plots_dir / f"{run_id}_ig_class_{cls}_mean_attr.png"
                         plt.savefig(out_path)
                         plt.close()
 
@@ -1517,14 +1723,67 @@ def main(base_path: Path, config_path: Path = None):
                         plt.ylabel('IG Attribution')
                         plt.title(f'IG Distribution Across Nodes (class {cls})')
                         plt.tight_layout()
-                        out_path = plots_dir / f"{run_id}_ig_class_{cls}_box.png"
+                        out_path = run_plots_dir / f"{run_id}_ig_class_{cls}_box.png"
                         plt.savefig(out_path)
                         plt.close()
+
+                    # Persist the full (class, node, feature) tensor so the
+                    # model-level aggregation module can compute averages that
+                    # span both class and node axes.
+                    if all_class_arrays:
+                        ig_tensor = np.stack(all_class_arrays, axis=0)  # (C, N, F)
+                        np.savez(
+                            run_models_dir / "explainability_ig.npz",
+                            attributions=ig_tensor,
+                            feature_names=np.array(feature_names, dtype=object),
+                        )
                 except Exception as e:
                     print(f"Integrated Gradients failed: {e}")
 
+            # Persist raw test-set predictions so ROC curves can be aggregated
+            # across every run of a given architecture (mean TPR at each FPR,
+            # with ±1 std band). Kept in the run's models dir alongside the
+            # other explainability outputs.
+            try:
+                np.savez(
+                    run_models_dir / "test_probs.npz",
+                    labels=np.asarray(final_labels),
+                    probs=np.asarray(final_probs),
+                )
+            except Exception as e:
+                print(f"Saving test_probs.npz failed: {e}")
+
         # After all runs, generate summary plots
         _generate_summary_plots(results_path, plots_dir)
+
+        # Emit the per-model best-run classification report and cross-model
+        # comparison plots so results are ready to inspect without a follow-up command.
+        try:
+            from masters_research.pipeline.model_type_report import main as run_model_type_report
+            run_model_type_report(base_path)
+        except Exception as e:
+            print(f"Per-model classification report generation skipped: {e}")
+
+        # Per-class breakdown visuals (row-normalised CM, seed-variance boxplots,
+        # cross-model per-class F1). Independent of model_type_report; if only one
+        # architecture has runs so far, the per-model plots still get produced.
+        try:
+            from masters_research.pipeline.per_class_report import main as run_per_class_report
+            run_per_class_report(base_path)
+        except Exception as e:
+            print(f"Per-class breakdown visuals skipped: {e}")
+
+        # Model-level explainability aggregation — reads the raw feature-mask /
+        # edge-mask / IG-attribution / test-probs npz files saved by each run
+        # and produces one canonical set of GNNExplainer + IG + ROC plots per
+        # architecture at models/<ModelType>/explainability/. Only produces
+        # outputs for architectures whose runs actually saved the arrays;
+        # legacy runs (no npz) are silently skipped.
+        try:
+            from masters_research.pipeline.explainability_report import main as run_explainability_report
+            run_explainability_report(base_path)
+        except Exception as e:
+            print(f"Model-level explainability aggregation skipped: {e}")
 
     except Exception:
         import traceback

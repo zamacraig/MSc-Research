@@ -41,9 +41,47 @@ def _resolve_results_csv(base_path: Path, cfg: Dict[str, Any]) -> Path:
 
 
 def _pick_best_row(df: pd.DataFrame) -> pd.Series:
-    # Prefer highest final test F1; if tied, pick max best_f1, otherwise first
-    df_sorted = df.sort_values(["f1", "best_f1"], ascending=[False, False])
+    # Prefer highest final test F1; fall back to val_f1 / best_f1 on legacy CSVs.
+    sort_cols = [c for c in ("final_test_f1", "val_f1", "best_f1", "f1") if c in df.columns]
+    if not sort_cols:
+        return df.iloc[0]
+    df_sorted = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
     return df_sorted.iloc[0]
+
+
+def _classify_run(params: Dict[str, Any]) -> str:
+    """Mirror pipeline/train.py::_model_type_from_cfg so we can rebuild per-run paths
+    for legacy CSVs that predate the model_type column."""
+    model_type = params.get("model_type")
+    if model_type == "simple_gcn" or bool(params.get("use_simple_gcn", False)):
+        return "SimpleGCN"
+    if model_type == "temporal_attention" or bool(params.get("use_temporal_attention", False)):
+        return "TemporalAttentionGNN"
+    if bool(params.get("use_attention", False)):
+        return "TemporalGAT_GRU"
+    return "TemporalGCN_GRU"
+
+
+def _resolve_run_dirs(best: pd.Series, params: Dict[str, Any], results_csv: Path,
+                      base_path: Path, cfg: Dict[str, Any]) -> Tuple[Path, Path]:
+    """Return (run_models_dir, run_plots_dir) for the best run, preferring the new
+    columns written by train.py and falling back to reconstructing paths from
+    (save_dir, plots_dir, model_type, run_id) for legacy CSVs."""
+    models_dir_str = str(best.get("run_models_dir", "") or "").strip()
+    plots_dir_str = str(best.get("run_plots_dir", "") or "").strip()
+    if models_dir_str and plots_dir_str:
+        return Path(models_dir_str), Path(plots_dir_str)
+
+    model_type = str(best.get("model_type", "") or "").strip() or _classify_run(params)
+    run_id = str(best["run_id"])
+
+    models_root = results_csv.parent
+    default_plots = base_path / "src" / "masters_research" / "artifacts" / "plots"
+    plots_root = Path(cfg.get("plots_dir", str(default_plots)))
+    if not plots_root.is_absolute():
+        plots_root = base_path / plots_root
+
+    return models_root / model_type / run_id, plots_root / model_type / run_id
 
 
 def _load_model(params: Dict[str, Any], num_classes: int, device: torch.device):
@@ -216,16 +254,20 @@ def main(base_path: Path | str) -> Path:
     classes = list(range(num_classes))
     cm = confusion_matrix(labels, preds, labels=classes)
 
-    # Save next to results CSV for easy discovery
-    out_png = results_csv.parent / f"{best['run_id']}_confusion_matrix_best.png"
-    out_csv = results_csv.parent / f"{best['run_id']}_confusion_matrix_best.csv"
+    # Route best-run reports into models/<model_type>/<run_id>/ and plots/<model_type>/<run_id>/
+    run_models_dir, run_plots_dir = _resolve_run_dirs(best, merged, results_csv, base_path, cfg)
+    run_models_dir.mkdir(parents=True, exist_ok=True)
+    run_plots_dir.mkdir(parents=True, exist_ok=True)
+
+    out_png = run_plots_dir / f"{best['run_id']}_confusion_matrix_best.png"
+    out_csv = run_models_dir / f"{best['run_id']}_confusion_matrix_best.csv"
     _save_cm(cm, classes, out_png, out_csv)
 
-    # Classification report (CSV + heatmap)
-    cr_png = results_csv.parent / f"{best['run_id']}_classification_report_best.png"
-    cr_csv = results_csv.parent / f"{best['run_id']}_classification_report_best.csv"
+    # Classification report (CSV + heatmap + text)
+    cr_png = run_plots_dir / f"{best['run_id']}_classification_report_best.png"
+    cr_csv = run_models_dir / f"{best['run_id']}_classification_report_best.csv"
     _save_classification_report(labels, preds, classes, cr_png, cr_csv)
-    cr_txt = results_csv.parent / f"{best['run_id']}_classification_report_best.txt"
+    cr_txt = run_models_dir / f"{best['run_id']}_classification_report_best.txt"
     _save_classification_report_text(labels, preds, classes, cr_txt)
 
     print(f"Best run: {best['run_id']} | model: {model_path}")

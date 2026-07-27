@@ -170,12 +170,50 @@ def _confusion_side_by_side(cm_pngs: dict[str, Path], out_path: Path) -> None:
     plt.close(fig)
 
 
+def _write_best_run_info(label: str, row: pd.Series, out_dir: Path) -> None:
+    """Drop a plain-text summary at the root of models/<model_type>/ so the best
+    run's identity and headline metrics are visible without opening the CSV."""
+    def _get(col: str, default: str = "") -> str:
+        val = row.get(col, default)
+        return "" if pd.isna(val) else str(val)
+
+    params_raw = row.get("params", "")
+    try:
+        params = _parse_params(params_raw)
+        params_block = json.dumps(params, indent=2, sort_keys=True)
+    except Exception:
+        params_block = str(params_raw)
+
+    lines = [
+        f"Best run for {label}",
+        "=" * (16 + len(label)),
+        f"  run_id             : {_get('run_id')}",
+        f"  val_accuracy       : {_get('val_accuracy')}",
+        f"  val_f1             : {_get('val_f1')}",
+        f"  final_test_accuracy: {_get('final_test_accuracy')}",
+        f"  final_test_f1      : {_get('final_test_f1')}",
+        f"  best_f1            : {_get('best_f1')}",
+        f"  duration_seconds   : {_get('duration_seconds')}",
+        f"  model_path         : {_get('model_path')}",
+        f"  best_model_path    : {_get('best_model_path')}",
+        f"  run_models_dir     : {_get('run_models_dir')}",
+        f"  run_plots_dir      : {_get('run_plots_dir')}",
+        "",
+        "Hyperparameters",
+        "---------------",
+        params_block,
+    ]
+    (out_dir / "best_run_info.txt").write_text("\n".join(lines))
+
+
 def main(base_path: Path | str) -> Path:
     base_path = Path(base_path).resolve()
     results_csv = _resolve_results_csv(base_path)
     models_dir = results_csv.parent
-    out_dir = models_dir / "model_type_reports"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Cross-model comparison plots live in models/model_type_reports/.
+    # Per-model best-run outputs live directly under models/<model_type>/.
+    comparison_dir = models_dir / "model_type_reports"
+    comparison_dir.mkdir(parents=True, exist_ok=True)
 
     df = pd.read_csv(results_csv)
     best_rows = _best_run_per_type(df)
@@ -193,50 +231,77 @@ def main(base_path: Path | str) -> Path:
         if row is None:
             continue
         run_id = row["run_id"]
-        cm_csv = models_dir / run_id / f"{run_id}_confusion_matrix.csv"
-        if not cm_csv.exists():
-            print(f"  [{label}] Skipping {run_id}: confusion matrix not found at {cm_csv}")
+        # Prefer the explicit run_models_dir column (new layout); fall back to
+        # models_dir/<model_type>/<run_id>/, then to legacy models_dir/<run_id>/.
+        run_dir_str = str(row.get("run_models_dir", "") or "").strip()
+        candidates = []
+        if run_dir_str:
+            candidates.append(Path(run_dir_str))
+        candidates.append(models_dir / label / run_id)
+        candidates.append(models_dir / run_id)  # legacy flat layout
+
+        cm_csv = next(
+            (c / f"{run_id}_confusion_matrix.csv" for c in candidates
+             if (c / f"{run_id}_confusion_matrix.csv").exists()),
+            None,
+        )
+        if cm_csv is None:
+            print(f"  [{label}] Skipping {run_id}: confusion matrix not found in "
+                  f"{[str(c) for c in candidates]}")
             continue
 
         y_true, y_pred, classes = _reconstruct_labels_preds(cm_csv)
         cm = confusion_matrix(y_true, y_pred, labels=classes)
 
-        out_png = out_dir / f"{label}_confusion_matrix.png"
-        out_csv = out_dir / f"{label}_confusion_matrix.csv"
-        _save_cm(cm, classes, out_png, out_csv)
-        cm_pngs[label] = out_png
+        # Per-model outputs at models/<model_type>/... (stable file names,
+        # overwritten on each rerun to always reflect the current best).
+        per_model_dir = models_dir / label
+        per_model_dir.mkdir(parents=True, exist_ok=True)
 
-        cr_png = out_dir / f"{label}_classification_report.png"
-        cr_csv = out_dir / f"{label}_classification_report.csv"
-        cr_txt = out_dir / f"{label}_classification_report.txt"
+        cm_out_png = per_model_dir / "confusion_matrix.png"
+        cm_out_csv = per_model_dir / "confusion_matrix.csv"
+        _save_cm(cm, classes, cm_out_png, cm_out_csv)
+
+        cr_png = per_model_dir / "classification_report.png"
+        cr_csv = per_model_dir / "classification_report.csv"
+        cr_txt = per_model_dir / "classification_report.txt"
         _save_classification_report(y_true, y_pred, classes, cr_png, cr_csv)
         _save_classification_report_text(y_true, y_pred, classes, cr_txt)
 
+        _write_best_run_info(label, row, per_model_dir)
+
+        # Copies for the cross-model comparison plots to pick up.
+        cmp_cm_png = comparison_dir / f"{label}_confusion_matrix.png"
+        cmp_cm_csv = comparison_dir / f"{label}_confusion_matrix.csv"
+        _save_cm(cm, classes, cmp_cm_png, cmp_cm_csv)
+        cm_pngs[label] = cmp_cm_png
+
         class_metrics[label], summary_metrics[label] = _parse_classification_report_text(cr_txt)
-        print(f"[{label}] best run: {run_id} (test F1={row['_score']:.4f}) -> {cr_txt}")
+        print(f"[{label}] best run: {run_id} (test F1={row['_score']:.4f})")
+        print(f"  → {per_model_dir}")
 
     if not class_metrics:
         raise RuntimeError("No model type had a usable completed run; nothing to report.")
 
-    _grouped_bars_per_class(class_metrics, "precision", out_dir / "per_class_precision_by_model_type.png")
-    _grouped_bars_per_class(class_metrics, "recall", out_dir / "per_class_recall_by_model_type.png")
-    _grouped_bars_per_class(class_metrics, "f1-score", out_dir / "per_class_f1_by_model_type.png")
-    _radar_chart_f1(class_metrics, out_dir / "radar_f1_by_model_type.png")
-    _averages_comparison(summary_metrics, out_dir / "averages_comparison_by_model_type.png")
-    _accuracy_f1_bar_chart(summary_metrics, out_dir / "accuracy_f1_by_model_type.png")
-    _confusion_side_by_side(cm_pngs, out_dir / "confusion_matrices_side_by_side.png")
+    _grouped_bars_per_class(class_metrics, "precision", comparison_dir / "per_class_precision_by_model_type.png")
+    _grouped_bars_per_class(class_metrics, "recall", comparison_dir / "per_class_recall_by_model_type.png")
+    _grouped_bars_per_class(class_metrics, "f1-score", comparison_dir / "per_class_f1_by_model_type.png")
+    _radar_chart_f1(class_metrics, comparison_dir / "radar_f1_by_model_type.png")
+    _averages_comparison(summary_metrics, comparison_dir / "averages_comparison_by_model_type.png")
+    _accuracy_f1_bar_chart(summary_metrics, comparison_dir / "accuracy_f1_by_model_type.png")
+    _confusion_side_by_side(cm_pngs, comparison_dir / "confusion_matrices_side_by_side.png")
 
     summary_df = pd.DataFrame(summary_metrics).T
     summary_df.index.name = "model_type"
-    summary_df.to_csv(out_dir / "model_type_comparison_summary.csv")
+    summary_df.to_csv(comparison_dir / "model_type_comparison_summary.csv")
 
     breakdown_df = _per_class_breakdown(class_metrics)
-    breakdown_df.to_csv(out_dir / "per_class_breakdown_by_model_type.csv", index=False)
+    breakdown_df.to_csv(comparison_dir / "per_class_breakdown_by_model_type.csv", index=False)
     print("\nPer-class breakdown by model type:")
     print(breakdown_df.to_string(index=False))
 
-    print(f"\nSaved per-model-type classification reports + comparison plots to: {out_dir}")
-    return out_dir
+    print(f"\nCross-model comparison plots saved to: {comparison_dir}")
+    return comparison_dir
 
 
 if __name__ == "__main__":

@@ -342,7 +342,28 @@ def create_temporal_dataset(
 
     print("Temporal dataset creation complete.")
 
-    return DynamicGraphTemporalSignalBatch(
+    # Reconstruct the exact per-snapshot feature ordering so downstream explainability
+    # tools (GNNExplainer / Integrated Gradients) can label axes with real names
+    # instead of numeric indices. Mirrors the assembly inside the snapshot loop above:
+    #   [base_feature_cols] + [detected lag/roll/diff cols] + Fourier(k=1,2) = [sin_1, cos_1, sin_2, cos_2]
+    _base_feature_cols = [
+        "AverageMaximumTemperature_x",
+        "AverageMinimunTemperature_x",
+        "AverageMaximumRelativeHumidity_x",
+        "AverageMinimumRelativeHumidity_x",
+        "TotalRainfall_x",
+        "AverageTotalRadiation_x",
+        "AverageWindSpeed_x",
+        "AverageTotalRelativeEvaporation_x",
+    ]
+    _lag_feature_cols = [
+        col for col in final_df.columns
+        if ("_lag" in col or "_roll" in col or "_diff" in col)
+    ]
+    _fourier_feature_cols = ["fourier_sin_1", "fourier_cos_1", "fourier_sin_2", "fourier_cos_2"]
+    feature_names = _base_feature_cols + _lag_feature_cols + _fourier_feature_cols
+
+    dataset = DynamicGraphTemporalSignalBatch(
         edge_indices=edge_indices_list,
         edge_weights=edge_weights_list,
         features=node_features_list,
@@ -350,6 +371,8 @@ def create_temporal_dataset(
         batches=all_batches,
         timestamps=timestamps_list,
     )
+    dataset.feature_names = feature_names
+    return dataset
 
 
 def stratified_temporal_signal_split(dataset: DynamicGraphTemporalSignalBatch, train_ratio: float = 0.8, num_classes: int | None = None):

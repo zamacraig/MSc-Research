@@ -122,8 +122,19 @@ class TemporalAttentionGNN(nn.Module):
         Use GAT instead of GCN for spatial layers
     gat_heads : int, default 4
         Number of GAT attention heads (if use_gat=True)
+    attention_dropout : float, optional
+        Dropout inside the temporal attention block. Defaults to `dropout` if unset —
+        exposing it lets you regularise the (data-hungry) attention layer more
+        aggressively than the rest of the network.
+    attention_gate_init : float, default 0.0
+        ReZero-style learnable scalar multiplied against the attention output before
+        the residual add. `0.0` means the network starts as a pure GCN+GRU and turns
+        the attention on gradually as training pushes the gate away from zero. This
+        is the main stability fix — un-gated attention at init drives seed-dependent
+        sign-flip failures on small datasets. Set to `1.0` to recover the legacy
+        (un-gated) behaviour.
     """
-    
+
     def __init__(
         self,
         in_channels: int,
@@ -136,6 +147,8 @@ class TemporalAttentionGNN(nn.Module):
         input_norm: bool = True,
         use_gat: bool = False,
         gat_heads: int = 4,
+        attention_dropout: float | None = None,
+        attention_gate_init: float = 0.0,
     ):
         super().__init__()
         self.hidden_channels = hidden_channels
@@ -143,11 +156,11 @@ class TemporalAttentionGNN(nn.Module):
         self._gru_layers = gru_layers
         self._use_input_norm = input_norm
         self._use_gat = use_gat
-        
+
         # Input Normalization
         if input_norm:
             self.input_norm = nn.BatchNorm1d(in_channels)
-        
+
         # Spatial layers (GCN or GAT)
         if use_gat:
             self.spatial_conv1 = GATConv(in_channels, hidden_channels, heads=gat_heads, concat=False)
@@ -155,31 +168,44 @@ class TemporalAttentionGNN(nn.Module):
         else:
             self.spatial_conv1 = GCNConv(in_channels, hidden_channels)
             self.spatial_conv2 = GCNConv(hidden_channels, hidden_channels)
-        
+
         self.bn1 = nn.BatchNorm1d(hidden_channels)
         self.bn2 = nn.BatchNorm1d(hidden_channels)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
-        
+
         # GRU for sequential processing
         self.gru = nn.GRU(
             hidden_channels, hidden_channels,
             num_layers=gru_layers, batch_first=False,
         )
-        
+
         # Temporal Attention
+        attn_dropout = attention_dropout if attention_dropout is not None else dropout
         self.temporal_attention = TemporalAttention(
             hidden_dim=hidden_channels,
             num_heads=temporal_heads,
-            dropout=dropout,
+            dropout=attn_dropout,
         )
-        
-        # Layer norm after attention
-        self.post_attn_norm = nn.LayerNorm(hidden_channels)
-        
+
+        # Pre-norm applied to both query and history BEFORE the attention block.
+        # Standard modern-Transformer choice: pre-norm is much more stable at init
+        # than post-norm (Xiong et al. 2020) — the residual add stays close to `x`
+        # while attention warms up rather than being dominated by an un-normalised
+        # random projection.
+        self.pre_attn_norm = nn.LayerNorm(hidden_channels)
+
+        # ReZero-style learnable gate on the attention residual. At init the gate
+        # is `attention_gate_init` (default 0), so `x + gate * attn_out ≈ x` and
+        # the model behaves exactly like a plain GCN+GRU. Training pulls the gate
+        # away from zero only when attention output actually improves the loss —
+        # this removes the "attention random-init roulette" that caused the class
+        # 0 <-> class 2 flip observed across seeds.
+        self.attn_gate = nn.Parameter(torch.full((1,), float(attention_gate_init)))
+
         # Classifier
         self.classifier = nn.Linear(hidden_channels, num_classes)
-        
+
         # History storage (NOT a registered buffer to avoid SWA buffer misalignment)
         # Using register_buffer causes issues with AveragedModel.update_parameters()
         # because the buffer list changes size after forward passes
@@ -233,25 +259,33 @@ class TemporalAttentionGNN(nn.Module):
         x_gru, hidden_out = self.gru(x.unsqueeze(0), hidden)
         x = x_gru.squeeze(0)  # [num_nodes, hidden_channels]
         
-        # Temporal Attention over history
-        # IMPORTANT: Detach history tensors to prevent backprop through past snapshots
+        # Temporal Attention over history (pre-norm + ReZero gate).
+        # Pre-norm: apply LayerNorm to the *inputs* of attention, not to the residual
+        # output. The residual therefore adds a small, gated correction to `x`
+        # instead of overwriting it — the block is stable at init even before the
+        # attention layer has learned anything useful.
         if self._history is None:
-            # First snapshot - no history yet
-            self._history = x.detach().unsqueeze(0)  # [1, num_nodes, H]
-            x_attn = x
+            # First snapshot of the sequence: no attention output yet. Use a true
+            # zero (not `x`) so the residual add remains `x + gate * 0 = x` — no
+            # magnitude spike into downstream layers on step 1 vs step 2+.
+            x_attn = x.new_zeros(x.shape)
+            self._history = x.detach().unsqueeze(0)
         else:
-            # Apply temporal attention (history is already detached)
-            x_attn = self.temporal_attention(x, self._history)
-            
-            # Update history buffer (FIFO) - detach current x before storing
+            x_norm = self.pre_attn_norm(x)
+            history_norm = self.pre_attn_norm(self._history)
+            x_attn = self.temporal_attention(x_norm, history_norm)
+
+            # Update history buffer (FIFO) — detach so gradients do not flow into
+            # past snapshots (truncated BPTT).
             x_detached = x.detach().unsqueeze(0)
             if self._history.size(0) >= self.history_len:
                 self._history = torch.cat([self._history[1:], x_detached], dim=0)
             else:
                 self._history = torch.cat([self._history, x_detached], dim=0)
-        
-        # Residual + Norm
-        x = self.post_attn_norm(x + x_attn)
+
+        # Gated residual (ReZero): attention starts as identity, gradually turns on
+        # as `attn_gate` diverges from its init.
+        x = x + self.attn_gate * x_attn
         x = self.dropout2(x)
         
         if batch is not None:

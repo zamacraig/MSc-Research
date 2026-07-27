@@ -69,18 +69,33 @@ def _parse_classification_report_text(path: Path) -> Tuple[pd.DataFrame, Dict[st
 
 
 def _find_latest_best_gnn_report(models_dir: Path) -> Optional[Path]:
-    candidates = sorted(models_dir.glob("*_classification_report_best.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    # Search recursively — under the new models/<model_type>/<run_id>/ layout, GNN
+    # classification reports live several levels deep. rglob also matches the old
+    # flat layout, so this covers both.
+    candidates = sorted(
+        models_dir.rglob("*_classification_report_best.txt"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
     return candidates[0] if candidates else None
 
 
-def _find_confusion_pngs(models_dir: Path) -> Dict[str, Optional[Path]]:
+def _find_confusion_pngs(models_dir: Path, plots_root: Optional[Path] = None) -> Dict[str, Optional[Path]]:
     paths = {
         'GNN': None,
         'RandomForest': models_dir / 'RandomForest_confusion_matrix.png',
         'Keras': models_dir / 'Keras_confusion_matrix.png',
     }
-    # GNN best
-    gnn_pngs = sorted(models_dir.glob("*_confusion_matrix_best.png"), key=lambda p: p.stat().st_mtime, reverse=True)
+    # GNN best confusion PNG is written by evaluate_best.py into the per-run plots
+    # dir under the new layout. Fall back to models_dir for legacy runs.
+    search_roots = []
+    if plots_root is not None:
+        search_roots.append(plots_root)
+    search_roots.append(models_dir)
+    gnn_pngs = []
+    for root in search_roots:
+        gnn_pngs.extend(root.rglob("*_confusion_matrix_best.png"))
+    gnn_pngs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     if gnn_pngs:
         paths['GNN'] = gnn_pngs[0]
     for k in ['RandomForest', 'Keras']:
@@ -234,7 +249,8 @@ def _stacked_recall_per_class(class_metrics: Dict[str, pd.DataFrame], out_path: 
 def main(base_path: Path | str) -> Path:
     base_path = Path(base_path).resolve()
     models_dir = base_path / 'src' / 'masters_research' / 'artifacts' / 'models'
-    plots_dir = base_path / 'src' / 'masters_research' / 'artifacts' / 'plots' / 'comparison'
+    plots_root = base_path / 'src' / 'masters_research' / 'artifacts' / 'plots'
+    plots_dir = plots_root / 'comparison'
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     # Locate classification reports
@@ -267,7 +283,7 @@ def main(base_path: Path | str) -> Path:
     _stacked_recall_per_class(class_metrics, plots_dir / 'stacked_recall_per_class.png')
 
     # Confusion matrices side-by-side
-    conf_pngs = _find_confusion_pngs(models_dir)
+    conf_pngs = _find_confusion_pngs(models_dir, plots_root=plots_root)
     _confusion_side_by_side(conf_pngs, plots_dir / 'confusion_matrices_side_by_side.png')
 
     print(f"Saved comparison plots to: {plots_dir}")
