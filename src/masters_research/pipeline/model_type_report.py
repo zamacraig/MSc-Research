@@ -121,7 +121,9 @@ def _accuracy_f1_bar_chart(summary_metrics: dict[str, dict], out_path: Path) -> 
 
     plt.figure(figsize=(max(8, len(summary_metrics) * 2.2), 5))
     sns.barplot(data=plot_df, x="model_type", y="value", hue="metric")
-    plt.ylim(0, 1)
+    # Zoom the y-axis to the score range actually populated by the results so
+    # sub-percentage-point differences between architectures remain legible.
+    plt.ylim(0.6, 1.0)
     plt.title("Accuracy & F1 by Model Type")
     plt.xlabel("Model Type")
     plt.ylabel("Score")

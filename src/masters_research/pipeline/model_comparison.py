@@ -168,7 +168,10 @@ def _plot_headline_metrics(df: pd.DataFrame, out_path: Path) -> None:
         tick_label.set_color(FAMILY_COLOURS[row["family"]])
         tick_label.set_fontweight("bold")
 
-    ax.set_ylim(0.0, 1.05)
+    # Zoom the y-axis to the range actually populated by the results so the
+    # tier separation between baselines (~0.90) and GNNs (~0.70–0.85) is
+    # legible without whitespace at the bottom dominating the plot.
+    ax.set_ylim(0.6, 1.0)
     ax.set_ylabel("Score")
     ax.set_xlabel("")
     ax.set_title("Model comparison — headline metrics (weighted averages)")
