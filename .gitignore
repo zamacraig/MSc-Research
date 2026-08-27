@@ -230,3 +230,6 @@ Dataset/TransientData/
 # Trained model weights
 /models/
 /ModelBackup/
+
+# Notebooks (exploratory, kept out of version control)
+/Notebooks/
