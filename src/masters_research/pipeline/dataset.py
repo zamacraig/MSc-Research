@@ -7,35 +7,60 @@ from torch_geometric_temporal.signal import DynamicGraphTemporalSignalBatch
 import numpy as np
 
 
-def _apply_seasonal_normalization(df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
+def _compute_seasonal_stats(df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
     """
-    Normalize features relative to their monthly (seasonal) statistics.
-    
+    Compute per-month (mean, std) statistics for the requested feature columns.
+
+    Kept separate from `_apply_seasonal_normalization` so the caller can fit
+    these statistics on the trainval slice only and then apply them to the
+    entire dataframe — the shape needed to prevent test-set values from
+    influencing the "typical January" baseline used to normalise training
+    features (see the leak-free pipeline design in Chapter 4 of the thesis).
+    """
+    tmp = df.copy()
+    tmp["_month"] = pd.to_datetime(tmp["TimeStamp"]).dt.month
+    return tmp.groupby("_month")[features].agg(["mean", "std"])
+
+
+def _apply_seasonal_normalization(
+    df: pd.DataFrame,
+    features: list[str],
+    stats: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Normalize features relative to per-month statistics.
+
     This converts raw values to z-scores within each month, so that:
     - A hot summer day (35°C in July) → z ≈ 0 (normal for July)
     - A cold winter day (10°C in January) → z ≈ 0 (normal for January)
-    
-    This removes the seasonal component from the features, leaving only
-    the residual variation that's meaningful for prediction.
+
+    Parameters
+    ----------
+    df, features
+        As before — the frame to transform and the columns to normalise.
+    stats
+        Pre-computed per-month (mean, std) DataFrame as returned by
+        `_compute_seasonal_stats`. If None, stats are computed from the
+        input dataframe itself — legacy behaviour, retained for backward
+        compatibility with any caller that doesn't supply a trainval slice.
     """
     df = df.copy()
-    
-    # Extract month from timestamp
+
+    # Extract month from timestamp for the lookup below.
     df["_month"] = pd.to_datetime(df["TimeStamp"]).dt.month
-    
-    # Compute per-month mean and std for each feature
-    monthly_stats = df.groupby("_month")[features].agg(["mean", "std"])
-    
-    # Z-score normalize each feature within its month
+
+    # Fit-on-supplied path (leak-free): use caller-provided stats.
+    # Fallback path: compute over the input df (mirrors the pre-fix behaviour).
+    if stats is None:
+        stats = df.groupby("_month")[features].agg(["mean", "std"])
+
+    # Z-score normalize each feature within its month.
     for feat in features:
-        month_mean = df["_month"].map(monthly_stats[(feat, "mean")])
-        month_std = df["_month"].map(monthly_stats[(feat, "std")]).replace(0, 1)
+        month_mean = df["_month"].map(stats[(feat, "mean")])
+        month_std = df["_month"].map(stats[(feat, "std")]).replace(0, 1)
         df[feat] = (df[feat] - month_mean) / month_std
-    
-    # Drop temporary column
-    df = df.drop(columns=["_month"])
-    
-    return df
+
+    return df.drop(columns=["_month"])
 
 
 def _add_temporal_lag_features(df: pd.DataFrame, lag_features: list[str], lags: list[int] = [1], rolling_windows: list[int] = [7]) -> pd.DataFrame:
@@ -101,10 +126,36 @@ def create_temporal_dataset(
     seasonal_normalization: bool = True,
     add_lag_features: bool = True,
     n_classes: int = 5,
+    test_holdout_ratio: float = 0.2,
+    stratified_split: bool = False,
 ) -> DynamicGraphTemporalSignalBatch:
     """
     Creates a temporal dataset from the final processed dataframe.
-    
+
+    **This builds a one-step-ahead FORECASTING dataset, not a nowcasting
+    one.** Node features `x` at snapshot t are the station's observed
+    weather context for month t (current-month features plus lag / rolling
+    / diff history and Fourier seasonal encoding). The label `y` at
+    snapshot t is the discretised quality category of month **t+1** — each
+    station's continuous quality signal is shifted one month forward before
+    discretisation. The most recent timestamp in the input data has no
+    t+1 and is therefore dropped entirely (142 raw timestamps -> up to 141
+    usable snapshots). This mirrors the `Shifted_Target` construction in
+    `baselines/baseline_models.py`, so the GNN and baseline pipelines solve
+    the same forecasting task and are directly comparable.
+
+    Preprocessing is **leak-free**: the temporal partitioning that will
+    eventually separate trainval from the held-out test set is reproduced
+    up front to produce a boolean trainval mask over `final_df` rows. That
+    mask is then used to fit every downstream parameter (seasonal monthly
+    stats, MinMax scaler statistics, and tercile discretisation edges on
+    the FORECAST target) on trainval rows only, before applying them to the
+    full dataframe. The returned dataset object is unchanged in structure —
+    the split logic in the training pipeline still operates over all
+    snapshots — but the values inside it have been computed without
+    allowing test statistics to influence how training samples are
+    transformed or classified.
+
     Parameters
     ----------
     final_df : pd.DataFrame
@@ -117,6 +168,15 @@ def create_temporal_dataset(
         key weather variables to capture temporal autocorrelation.
     n_classes : int, default 5
         Number of classes for target discretization.
+    test_holdout_ratio : float, default 0.2
+        Fraction of timestamps reserved for the final held-out test set;
+        used here only to identify which rows belong to trainval so that
+        all fit-time preprocessing parameters are learned on trainval rows.
+        Must match the value passed to the outer split later in the
+        training pipeline for the mask to align correctly.
+    stratified_split : bool, default False
+        Match the caller's outer split strategy: True → interleaved
+        every-k-th-timestamp split; False → chronological first-N split.
     """
     print("Creating temporal dataset...")
 
@@ -153,52 +213,161 @@ def create_temporal_dataset(
         print(f"- {feature}")
     print("=" * 50)
 
-    # Apply normalization based on configuration
+    # -----------------------------------------------------------------
+    # Trainval mask — reproduce the outer temporal split up-front so that
+    # every fit-time operation below sees only trainval rows. This is the
+    # single structural change that makes the leak fix possible without
+    # restructuring the rest of the pipeline.
+    # -----------------------------------------------------------------
+    sorted_ts = sorted(final_df["TimeStamp"].unique())
+    n_total_ts = len(sorted_ts)
+    n_test_ts = max(1, int(round(n_total_ts * test_holdout_ratio)))
+    if stratified_split:
+        # Every-k-th-timestamp scheme — mirrors interleaved_temporal_split.
+        step = n_total_ts / n_test_ts
+        test_ts_positions = {min(int(i * step), n_total_ts - 1) for i in range(n_test_ts)}
+        trainval_ts = [ts for i, ts in enumerate(sorted_ts) if i not in test_ts_positions]
+    else:
+        # Chronological first-N scheme — mirrors temporal_signal_split.
+        trainval_ts = sorted_ts[: n_total_ts - n_test_ts]
+    trainval_mask = final_df["TimeStamp"].isin(trainval_ts)
+    print(f"Trainval mask: {int(trainval_mask.sum())}/{len(final_df)} rows "
+          f"({100.0 * trainval_mask.mean():.1f}%) — used for leak-free fitting below.")
+
+    # Apply normalization based on configuration (all fits on trainval only).
     if seasonal_normalization:
         print("Applying SEASONAL normalization (per-month z-scores)...")
-        print("  This removes seasonal drift by normalizing relative to monthly baselines.")
-        final_df = _apply_seasonal_normalization(final_df, features_to_scale)
-        # After seasonal z-scoring, rescale to 0-1 for consistency
+        print("  Monthly stats fit on TRAINVAL rows only, applied to full frame.")
+        seasonal_stats = _compute_seasonal_stats(
+            final_df[trainval_mask], features_to_scale
+        )
+        final_df = _apply_seasonal_normalization(final_df, features_to_scale, seasonal_stats)
+        # After seasonal z-scoring, rescale to 0-1 for consistency.
         scaler = MinMaxScaler()
-        final_df[features_to_scale] = scaler.fit_transform(final_df[features_to_scale])
-        print("Seasonal normalization + MinMax rescaling complete.")
+        scaler.fit(final_df.loc[trainval_mask, features_to_scale])
+        final_df[features_to_scale] = scaler.transform(final_df[features_to_scale])
+        print("Seasonal normalization + MinMax rescaling complete (trainval-fit).")
     else:
         print("Applying GLOBAL normalization (MinMaxScaler across all timestamps)...")
         print("  Warning: Seasonal drift patterns will be preserved in the features.")
+        print("  Scaler fit on TRAINVAL rows only, applied to full frame.")
         scaler = MinMaxScaler()
-        final_df[features_to_scale] = scaler.fit_transform(final_df[features_to_scale])
-        print("Feature scaling complete.")
+        scaler.fit(final_df.loc[trainval_mask, features_to_scale])
+        final_df[features_to_scale] = scaler.transform(final_df[features_to_scale])
+        print("Feature scaling complete (trainval-fit).")
 
-    # Recompute Target_x as the mean of the NOW-normalized feature columns.
-    # This ensures the target reflects a fair composite, regardless of what was
-    # stored in the source CSV (which may have used raw unnormalized values).
-    final_df["Target_x"] = final_df[features_to_scale].mean(axis=1)
-    print("Target_x recomputed from normalized features.")
+    # Recompute Target_x_continuous as the mean of the NOW-normalized feature
+    # columns. This is the *same-month* composite quality signal — it is not
+    # the forecasting label itself, only the raw material the label is built
+    # from (see the forward-shift step immediately below).
+    final_df["Target_x_continuous"] = final_df[features_to_scale].mean(axis=1)
+    print("Target_x_continuous recomputed from normalized features (same-month).")
 
-    # Discretize target variable into n_classes classes.
-    # pd.qcut is tried first (equal-frequency); if duplicate bin edges reduce the
-    # number of unique classes below n_classes, pd.cut (equal-width) is used as a fallback
-    # so that exactly n_classes non-empty classes are always produced.
-    print(f"Discretizing into {n_classes} classes...")
-    raw_bins = pd.qcut(final_df["Target_x"], q=n_classes, labels=False, duplicates="drop")
-    actual_classes = raw_bins.nunique()
-    if actual_classes < n_classes:
-        print(
-            f"  WARNING: pd.qcut produced only {actual_classes} bins (duplicate bin edges). "
-            f"Falling back to equal-width pd.cut to guarantee {n_classes} classes."
+    # -----------------------------------------------------------------
+    # Forecasting shift — this study predicts NEXT month's quality category
+    # from the CURRENT month's observed context, not the current month's own
+    # category. To build that label, each station's same-month continuous
+    # target is shifted one month forward in time: the label attached to
+    # month t is the (not-yet-discretised) quality signal observed at t+1.
+    #
+    # final_df is an edge-list (one row per station per neighbour-edge per
+    # timestamp), so the shift is computed on a deduplicated one-row-per
+    # -station-month table and merged back — a per-row groupby().shift(-1)
+    # would incorrectly shift across duplicate same-month edge rows instead
+    # of across months. The dataset is a fully regular monthly panel (see
+    # the temporal quality audit: node coverage and timestamp regularity are
+    # both perfect), so a plain positional shift within each station's
+    # chronologically-sorted month sequence is safe and exact.
+    # -----------------------------------------------------------------
+    print("Building one-month-ahead forecasting target (t -> t+1)...")
+    node_month_targets = (
+        final_df[["Compno_x", "TimeStamp", "Target_x_continuous"]]
+        .drop_duplicates(subset=["Compno_x", "TimeStamp"])
+        .sort_values(["Compno_x", "TimeStamp"])
+    )
+    node_month_targets["Target_x_continuous_forecast"] = (
+        node_month_targets.groupby("Compno_x")["Target_x_continuous"].shift(-1)
+    )
+    final_df = final_df.merge(
+        node_month_targets[["Compno_x", "TimeStamp", "Target_x_continuous_forecast"]],
+        on=["Compno_x", "TimeStamp"], how="left",
+    )
+
+    # The most recent timestamp has no t+1 for any station and therefore no
+    # valid forecasting label — drop it entirely, mirroring the dropna used
+    # for the equivalent shift in the baseline pipeline (baseline_models.py).
+    n_before = final_df["TimeStamp"].nunique()
+    final_df = final_df.dropna(subset=["Target_x_continuous_forecast"]).reset_index(drop=True)
+    n_after = final_df["TimeStamp"].nunique()
+    print(f"  Dropped final timestamp (no t+1 available): {n_before} -> {n_after} timestamps.")
+
+    # Re-derive the trainval mask against the filtered frame. trainval_ts is
+    # a list of timestamp *values* (unaffected by row filtering), so this
+    # simply re-applies the same partition boundary already established
+    # above, now aligned to final_df's post-drop index.
+    trainval_mask = final_df["TimeStamp"].isin(trainval_ts)
+
+    # -----------------------------------------------------------------
+    # Discretize the FORECASTING target — bin edges fit on TRAINVAL rows
+    # only, then applied to the full frame. Test-set samples that fall
+    # outside the trainval range are clipped to the nearest tier so no NaN
+    # labels propagate downstream. Test-set class supports may therefore be
+    # uneven — this honestly reflects distribution shift rather than hiding
+    # it by construction.
+    # -----------------------------------------------------------------
+    print(f"Discretizing into {n_classes} classes (bin edges fit on TRAINVAL forecast targets only)...")
+    trainval_targets = final_df.loc[trainval_mask, "Target_x_continuous_forecast"]
+
+    try:
+        _, bin_edges = pd.qcut(
+            trainval_targets, q=n_classes, labels=False,
+            duplicates="drop", retbins=True,
         )
-        raw_bins = pd.cut(final_df["Target_x"], bins=n_classes, labels=False)
+    except ValueError:
+        bin_edges = None
 
-    # Relabel to consecutive integers 0..k-1 (guards against any gaps left by either method)
-    label_map = {old: new for new, old in enumerate(sorted(raw_bins.dropna().unique()))}
-    final_df["Target_x"] = raw_bins.map(label_map)
+    if bin_edges is None or len(bin_edges) - 1 < n_classes:
+        print(
+            f"  WARNING: pd.qcut on trainval produced fewer than {n_classes} bins. "
+            f"Falling back to equal-width pd.cut over the trainval range."
+        )
+        _, bin_edges = pd.cut(trainval_targets, bins=n_classes, labels=False, retbins=True)
 
-    # Report the resulting distribution
-    dist = final_df["Target_x"].value_counts().sort_index()
-    total = dist.sum()
+    # Pad outer edges so any test-only extreme values still map inside a bin.
+    eps = 1e-9
+    bin_edges = np.asarray(bin_edges, dtype=float).copy()
+    bin_edges[0] -= eps
+    bin_edges[-1] += eps
+
+    binned = pd.cut(
+        final_df["Target_x_continuous_forecast"], bins=bin_edges,
+        labels=False, include_lowest=True,
+    )
+    # Any residual out-of-range test sample (should be near-impossible after
+    # the epsilon padding) is clipped to the nearest tier by direction.
+    below = final_df["Target_x_continuous_forecast"] < bin_edges[0]
+    above = final_df["Target_x_continuous_forecast"] > bin_edges[-1]
+    binned = binned.astype("float")
+    binned.loc[below] = 0
+    binned.loc[above] = n_classes - 1
+    # Target_x is the column name every downstream consumer (snapshot
+    # builder, training pipeline, baselines comparison) expects. Its VALUE
+    # now encodes next-month's category, not the current month's — this is
+    # the one-line hinge that converts the pipeline from nowcasting to
+    # one-step-ahead forecasting.
+    final_df["Target_x"] = binned.astype(int)
+
+    # Report the resulting distribution per partition so the trainval/test
+    # split is honest and visible in the training log.
     print("Target discretization complete. Distribution:")
-    for cls, cnt in dist.items():
-        print(f"  Class {int(cls)}: {cnt} samples ({100.0 * cnt / total:.1f}%)")
+    for label, mask in [("Trainval", trainval_mask), ("Test    ", ~trainval_mask)]:
+        dist = final_df.loc[mask, "Target_x"].value_counts().sort_index()
+        total = int(dist.sum())
+        if total == 0:
+            continue
+        print(f"  [{label}]")
+        for cls, cnt in dist.items():
+            print(f"    Class {int(cls)}: {cnt} samples ({100.0 * cnt / total:.1f}%)")
 
     # Timestamps
     timestamps = final_df["TimeStamp"].unique()

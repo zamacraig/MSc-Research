@@ -221,3 +221,12 @@ __marimo__/
 # Local artifact backups
 src/masters_research/artifacts_backup.zip
 src/masters_research/artifacts/
+
+# Dataset (raw + processed data, kept out of version control)
+Dataset/OriginalDataset/
+Dataset/OriginalDataset.7z
+Dataset/TransientData/
+
+# Trained model weights
+/models/
+/ModelBackup/

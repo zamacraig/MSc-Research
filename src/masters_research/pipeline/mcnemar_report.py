@@ -281,6 +281,10 @@ def _rebuild_splits(base_path: Path, cfg: dict):
         seasonal_normalization=cfg.get("seasonal_normalization", True),
         add_lag_features=cfg.get("add_lag_features", True),
         n_classes=int(cfg.get("num_classes", 3)),
+        # Leak-free preprocessing — trainval-only fit for scaler / seasonal
+        # stats / tercile bin edges. Must mirror the outer split.
+        test_holdout_ratio=float(cfg.get("test_holdout_ratio", 0.2)),
+        stratified_split=bool(cfg.get("stratified_split", False)),
     )
     test_holdout = float(cfg.get("test_holdout_ratio", 0.2))
     # Match the outer split style used by the GNN pipeline: interleaved if

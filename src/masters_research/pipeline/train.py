@@ -1262,10 +1262,15 @@ def main(base_path: Path, config_path: Path = None):
         n_classes_for_dataset = int(_nc[0] if isinstance(_nc, list) else _nc)
         
         dataset = create_temporal_dataset(
-            final_df, 
+            final_df,
             seasonal_normalization=seasonal_norm,
             add_lag_features=add_lag_features,
             n_classes=n_classes_for_dataset,
+            # Leak-free preprocessing: fit seasonal stats, scaler, and target
+            # bin edges on the trainval slice only. These two args must mirror
+            # the outer split used later so the mask aligns row-for-row.
+            test_holdout_ratio=float(cfg.get("test_holdout_ratio", 0.2)),
+            stratified_split=bool(cfg.get("stratified_split", False)),
         )
         
         # Dynamically determine in_channels from actual data

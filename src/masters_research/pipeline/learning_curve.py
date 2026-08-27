@@ -245,6 +245,9 @@ def main(base_path: Path, config_path: Path, seeds: tuple[int, ...] = (42,),
         seasonal_normalization=cfg.get("seasonal_normalization", True),
         add_lag_features=cfg.get("add_lag_features", True),
         n_classes=int(cfg.get("num_classes", 3)),
+        # Leak-free preprocessing — see pipeline.train for rationale.
+        test_holdout_ratio=float(cfg.get("test_holdout_ratio", 0.2)),
+        stratified_split=bool(cfg.get("stratified_split", False)),
     )
     cfg["in_channels"] = int(dataset.features[0].shape[1])
     num_classes = int(cfg.get("num_classes", 3))
