@@ -423,12 +423,15 @@ def create_temporal_dataset(
         
         all_feature_cols = base_feature_cols + lag_feature_cols
 
-        # Node features - deduplicate by Compno_x ONLY, then select features
-        # This ensures we get one row per node even when lag features differ slightly across edges
+        # Node features - deduplicate by Compno_x_encoded ONLY, then select features.
+        # Sorting by the LabelEncoder-assigned id (0..N-1) — rather than the raw
+        # ComputerNo station id — is what makes row i of `x` correspond to node
+        # index i in `edge_indices` below; the raw station ids are arbitrary
+        # hardware numbers, not contiguous small integers.
         node_features = (
-            df_timestamp[["Compno_x"] + all_feature_cols]
-            .drop_duplicates(subset=["Compno_x"])
-            .sort_values(by="Compno_x")
+            df_timestamp[["Compno_x_encoded"] + all_feature_cols]
+            .drop_duplicates(subset=["Compno_x_encoded"])
+            .sort_values(by="Compno_x_encoded")
         )
         x = torch.tensor(
             node_features[all_feature_cols].values,
@@ -463,19 +466,20 @@ def create_temporal_dataset(
         )
         x = torch.cat([x, temporal_enc], dim=1)   # [num_nodes, base_features + lag_features + 4]
 
-        # Edge indices
-        edge_indices = torch.tensor(df_timestamp[["Compno_x", "Compno_y"]].values.T, dtype=torch.long)
+        # Edge indices — must reference the encoded 0..N-1 node ids, matching
+        # the row order of `x` above and `targets_tensor` below.
+        edge_indices = torch.tensor(df_timestamp[["Compno_x_encoded", "Compno_y_encoded"]].values.T, dtype=torch.long)
 
         # Edge weights: INVERSE distance so closer stations have HIGHER influence
         # Using exp(-distance) for smooth decay; epsilon prevents division by zero
         distances = df_timestamp["distance_km"].values
         edge_weights = torch.tensor(np.exp(-distances), dtype=torch.float)
 
-        # Targets - must match node_features extraction (one per node)
+        # Targets - must match node_features extraction (one per node, same order)
         targets_df = (
-            df_timestamp[["Compno_x", "Target_x"]]
-            .drop_duplicates(subset=["Compno_x"])
-            .sort_values(by="Compno_x")
+            df_timestamp[["Compno_x_encoded", "Target_x"]]
+            .drop_duplicates(subset=["Compno_x_encoded"])
+            .sort_values(by="Compno_x_encoded")
         )
         targets_np = np.array(targets_df["Target_x"].values, dtype=np.float64)
         targets_tensor = torch.tensor(targets_np, dtype=torch.float)
