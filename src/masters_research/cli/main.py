@@ -35,8 +35,24 @@ def main():
             config_path = project_root / config_path
         print(f"Using config: {config_path}")
 
-    run_training(base_path=project_root, config_path=config_path)
-    print("GNN pipeline finished successfully.")
+    # A config asking for outer cross-validation is dispatched to the CV driver,
+    # which runs the pipeline once per fold and then pools the held-out
+    # predictions. Absent (or 1), behaviour is the ordinary single-split run.
+    import json
+    n_outer = 1
+    if config_path is not None and Path(config_path).exists():
+        try:
+            n_outer = int(json.loads(Path(config_path).read_text()).get("outer_cv_folds", 1))
+        except Exception:
+            n_outer = 1
+
+    if n_outer > 1:
+        from masters_research.pipeline.outer_cv import main as run_outer_cv
+        run_outer_cv(base_path=project_root, config_path=config_path)
+        print("Outer-CV pipeline finished successfully.")
+    else:
+        run_training(base_path=project_root, config_path=config_path)
+        print("GNN pipeline finished successfully.")
 
 
 if __name__ == "__main__":

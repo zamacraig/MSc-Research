@@ -248,6 +248,10 @@ def main(base_path: Path, config_path: Path, seeds: tuple[int, ...] = (42,),
         # Leak-free preprocessing — see pipeline.train for rationale.
         test_holdout_ratio=float(cfg.get("test_holdout_ratio", 0.2)),
         stratified_split=bool(cfg.get("stratified_split", False)),
+        forecast_horizon=int(cfg.get("forecast_horizon", 1)),
+        target_type=str(cfg.get("target_type", "feature_mean")),
+        target_window=int(cfg.get("target_window", 3)),
+        base_path=base_path,
     )
     cfg["in_channels"] = int(dataset.features[0].shape[1])
     num_classes = int(cfg.get("num_classes", 3))

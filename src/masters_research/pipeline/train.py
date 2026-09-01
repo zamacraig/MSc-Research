@@ -242,6 +242,8 @@ def diagnose_loss_components(model, criterion, data_snapshot, entropy_weight=0.0
         result = model(data_snapshot.x, data_snapshot.edge_index, data_snapshot.edge_attr)
         out = result[0] if isinstance(result, tuple) else result
         targets = data_snapshot.y.clone().to(torch.long)
+        labelled = targets >= 0
+        out, targets = out[labelled], targets[labelled]
         
         # Focal/CE loss component
         focal_loss = criterion(out, targets).item()
@@ -372,17 +374,25 @@ def train_epoch(model, optimizer, criterion, train_loader, grad_clip=None, entro
         if hidden is not None:
             hidden = hidden.detach()  # truncated BPTT — don't backprop through prior snapshots
         targets_long = snapshot.y.clone().to(torch.long)
-        loss = criterion(out, targets_long)
+        # Nodes labelled -1 have no drought index for the target month (index
+        # warm-up, or the station missing from the raw record). They stay in
+        # the graph so neighbours can still aggregate their features, but they
+        # must not contribute a loss term — there is no truth to compare to.
+        labelled = targets_long >= 0
+        if not bool(labelled.any()):
+            continue
+        out_l, targets_long = out[labelled], targets_long[labelled]
+        loss = criterion(out_l, targets_long)
         
         # Track prediction entropy for collapse detection
-        batch_entropy = compute_prediction_entropy(out)
+        batch_entropy = compute_prediction_entropy(out_l)
         total_entropy += batch_entropy
         
         # Add entropy regularization to prevent mode collapse
         # When model collapses to predicting one class, entropy is low
         # This term encourages spreading predictions across classes
         if entropy_weight > 0:
-            entropy_loss = entropy_regularization(out)
+            entropy_loss = entropy_regularization(out_l)
             loss = loss + entropy_weight * entropy_loss
         
         # Add L2 penalty on classifier layer (separate from weight_decay)
@@ -433,9 +443,13 @@ def test_model(model, loader):
             out, hidden = result if isinstance(result, tuple) else (result, None)
             preds = out.argmax(dim=1)
             probs = out.exp()  # since model outputs log_softmax
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(snapshot.y.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
+            # Same masking as training: unlabelled nodes are predicted (the
+            # forward pass needs the full graph) but never scored.
+            labels = snapshot.y.to(torch.long)
+            labelled = (labels >= 0).cpu().numpy()
+            all_preds.extend(preds.cpu().numpy()[labelled])
+            all_labels.extend(labels.cpu().numpy()[labelled])
+            all_probs.extend(probs.cpu().numpy()[labelled])
     return np.array(all_preds), np.array(all_labels), np.array(all_probs)
 
 
@@ -471,13 +485,19 @@ def _print_class_balance_for_dataset(name: str, dataset, num_classes: int):
         return
 
     labels = np.concatenate(all_labels, axis=0)
+    n_unlabelled = int((labels < 0).sum())
+    labels = labels[labels >= 0]          # sentinel -1 = no drought index
+    if labels.size == 0:
+        print(f"No labels found for {name}; skipping class balance.")
+        return
     counts = np.bincount(labels, minlength=num_classes)
     total = labels.size
 
     print("\n" + "=" * 50)
     print(f"CLASS BALANCE - {name}")
     print("=" * 50)
-    print(f"Total labeled samples: {total}")
+    print(f"Total labeled samples: {total}"
+          + (f"  ({n_unlabelled} unlabelled nodes masked out)" if n_unlabelled else ""))
     for cls in range(num_classes):
         count = int(counts[cls])
         pct = (100.0 * count / total) if total > 0 else 0.0
@@ -719,6 +739,9 @@ def _dataset_class_counts(dataset, num_classes: int) -> np.ndarray:
     if not all_labels:
         return np.zeros(num_classes, dtype=float)
     concat = np.concatenate(all_labels)
+    concat = concat[concat >= 0]        # drop unlabelled nodes (sentinel -1)
+    if concat.size == 0:
+        return np.zeros(num_classes, dtype=float)
     return np.bincount(concat, minlength=num_classes).astype(float)
 
 
@@ -973,6 +996,10 @@ def _train_one_fold(
     print(f"  [{fold_label}] Starting training...")
     start_time      = time.time()
     best_f1         = -1.0
+    # Raw (unsmoothed) val F1 at the epoch whose checkpoint was retained.
+    # best_f1 may hold a smoothed selection score, so keep the raw value
+    # for any comparison that must stay on the same scale (e.g. SWA).
+    best_raw_f1     = -1.0
     best_model_path = None
     eval_interval   = int(cfg_run.get("eval_interval",         cfg.get("eval_interval",         1)))
     min_delta       = float(cfg_run.get("early_stopping_min_delta", cfg.get("early_stopping_min_delta", 0.0)))
@@ -1087,8 +1114,26 @@ def _train_one_fold(
                 prev_bn_stats = bn_diag['stats']  # Save for next comparison
             
             last_val_f1 = f1
-            if f1 > best_f1 + min_delta:
-                best_f1          = f1
+
+            # --- Checkpoint selection criterion ---
+            # Selecting the single best-scoring epoch out of ~60 evaluations on a
+            # small validation set takes the maximum of many noisy estimates, which
+            # is optimistically biased: it partly selects validation noise rather
+            # than genuine skill. Measured effect on this project: GNN runs showed a
+            # +0.10..+0.14 val->test gap while the non-checkpoint-selecting baselines
+            # showed ~0.00. Averaging the last `selection_window` evaluations before
+            # comparing suppresses that noise, so the retained checkpoint reflects a
+            # sustained level rather than a lucky epoch.
+            # Set selection_window = 1 to recover the original best-epoch behaviour.
+            _sel_window = int(cfg_run.get("selection_window", cfg.get("selection_window", 5)))
+            if _sel_window > 1:
+                selection_score = float(np.mean(f1_history[-_sel_window:]))
+            else:
+                selection_score = f1
+
+            if selection_score > best_f1 + min_delta:
+                best_f1          = selection_score
+                best_raw_f1      = f1
                 patience_counter = 0
                 if cfg_run.get("save_best", cfg.get("save_best", True)):
                     run_models_dir.mkdir(parents=True, exist_ok=True)
@@ -1127,14 +1172,16 @@ def _train_one_fold(
         # Compare SWA model vs best checkpoint
         swa_preds, swa_labels, swa_probs = test_model(swa_model, val_loader)
         swa_f1 = float(f1_score(swa_labels, swa_preds, average="weighted"))
-        print(f"  [{fold_label}] SWA Val F1: {swa_f1:.4f} (vs best checkpoint: {best_f1:.4f})")
+        print(f"  [{fold_label}] SWA Val F1: {swa_f1:.4f} "
+              f"(vs best checkpoint raw: {best_raw_f1:.4f})")
         
         # Use SWA model if it's better
-        if swa_f1 > best_f1:
+        if swa_f1 > best_raw_f1:
             print(f"  [{fold_label}] Using SWA model (better than checkpoint)")
             # Copy SWA weights to the main model
             model.load_state_dict(swa_model.module.state_dict())
             best_f1 = swa_f1
+            best_raw_f1 = swa_f1
         elif best_model_path and Path(best_model_path).exists():
             model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
     elif best_model_path and Path(best_model_path).exists():
@@ -1166,7 +1213,8 @@ def _train_one_fold(
     }
 
 
-def main(base_path: Path, config_path: Path = None):
+def main(base_path: Path, config_path: Path = None, cv_fold: int | None = None,
+         n_outer_folds: int = 5, run_reports: bool = True):
     """
     Main function to run the training and evaluation pipeline.
     
@@ -1176,6 +1224,17 @@ def main(base_path: Path, config_path: Path = None):
         Project root directory
     config_path : Path, optional
         Path to config JSON file. If None, defaults to configs/default.json
+    cv_fold : int, optional
+        When set, this invocation evaluates one fold of the rotating outer
+        cross-validation instead of the single fixed hold-out. The fold index
+        selects which months are held out AND which months the scalers, seasonal
+        statistics and bin edges are fit on, so each fold stays leak-free.
+        Driven by outer_cv.py; leave as None for the ordinary single-split run.
+    n_outer_folds : int
+        Total number of outer folds, used with cv_fold.
+    run_reports : bool
+        Set False for individual CV folds so the cross-run aggregate reports are
+        produced once over the pooled results rather than once per fold.
     """
     base_path = Path(base_path).resolve()
     if config_path is None:
@@ -1271,6 +1330,16 @@ def main(base_path: Path, config_path: Path = None):
             # the outer split used later so the mask aligns row-for-row.
             test_holdout_ratio=float(cfg.get("test_holdout_ratio", 0.2)),
             stratified_split=bool(cfg.get("stratified_split", False)),
+            # 1 = one-month-ahead forecasting (default); 0 = same-month
+            # classification. See create_temporal_dataset for the caveat
+            # attached to horizon 0.
+            forecast_horizon=int(cfg.get("forecast_horizon", 1)),
+            # "feature_mean" (legacy, circular) | "spi" | "spei"
+            target_type=str(cfg.get("target_type", "feature_mean")),
+            target_window=int(cfg.get("target_window", 3)),
+            base_path=base_path,
+            cv_fold=cv_fold,
+            n_outer_folds=n_outer_folds,
         )
         
         # Dynamically determine in_channels from actual data
@@ -1305,7 +1374,8 @@ def main(base_path: Path, config_path: Path = None):
             print("  Outer split strategy: interleaved (systematic) sampling — each season is proportionally")
             print("  represented in both the train+val pool and the final test set.")
             trainval_dataset, final_test_dataset = interleaved_temporal_split(
-                dataset, train_ratio=outer_train_ratio
+                dataset, train_ratio=outer_train_ratio,
+                cv_fold=cv_fold, n_outer_folds=n_outer_folds,
             )
         else:
             trainval_dataset, final_test_dataset = temporal_signal_split(dataset, train_ratio=outer_train_ratio)
@@ -1326,6 +1396,8 @@ def main(base_path: Path, config_path: Path = None):
         # Run grid of experiments
         for run_idx, cfg_run in enumerate(grid, start=1):
             run_prefix = cfg.get("run_name", "run")
+            if cv_fold is not None:
+                run_prefix = f"{run_prefix}_f{cv_fold}"
             # Canonical architecture name determines the folder layout for this run.
             model_type_name = _model_type_from_cfg(cfg_run)
             # Include model_type in run_id for clarity
@@ -1745,18 +1817,80 @@ def main(base_path: Path, config_path: Path = None):
                 except Exception as e:
                     print(f"Integrated Gradients failed: {e}")
 
-            # Persist raw test-set predictions so ROC curves can be aggregated
-            # across every run of a given architecture (mean TPR at each FPR,
-            # with ±1 std band). Kept in the run's models dir alongside the
-            # other explainability outputs.
+            # Persist raw predictions so ROC curves can be aggregated across every
+            # run of a given architecture (mean TPR at each FPR, with ±1 std band).
+            #
+            # NOTE: this file previously stored the VALIDATION predictions
+            # (`final_labels`/`final_probs` are the selected fold's val output)
+            # despite its name and its consumers treating it as the held-out test
+            # set. It now stores the genuine held-out test predictions from
+            # `test_model(model, final_test_loader)` above. The validation arrays
+            # are kept alongside under explicit names so nothing is lost.
             try:
                 np.savez(
                     run_models_dir / "test_probs.npz",
-                    labels=np.asarray(final_labels),
-                    probs=np.asarray(final_probs),
+                    labels=np.asarray(ht_labels),
+                    probs=np.asarray(ht_probs),
+                    val_labels=np.asarray(final_labels),
+                    val_probs=np.asarray(final_probs),
                 )
             except Exception as e:
                 print(f"Saving test_probs.npz failed: {e}")
+
+        # --- Non-graph baselines, trained on the SAME data as the GNNs ---
+        # Run inside the main pipeline (rather than as a separate script) so
+        # the baselines inherit the identical dataset, splits, preprocessing
+        # and t+1 label. That is what makes the cross-family comparison and
+        # the paired McNemar tests valid without any re-alignment step.
+        if bool(cfg.get("run_baselines", True)):
+            try:
+                from masters_research.pipeline.baselines_runner import run_baselines
+                _seeds = cfg.get("seed", [42])
+                _seeds = _seeds if isinstance(_seeds, list) else [_seeds]
+                # Reproduce the inner split the grid runs used. It depends only
+                # on trainval_dataset and train_ratio/stratified_split (not on
+                # seed or model width), so it is identical for every grid run.
+                _inner_ratio = float(cfg.get("train_ratio", 0.8))
+                if bool(cfg.get("stratified_split", False)):
+                    from masters_research.pipeline.dataset import stratified_temporal_signal_split
+                    _bl_train, _bl_val = stratified_temporal_signal_split(
+                        trainval_dataset, train_ratio=_inner_ratio,
+                        num_classes=overall_num_classes,
+                    )
+                else:
+                    _bl_train, _bl_val = temporal_signal_split(
+                        trainval_dataset, train_ratio=_inner_ratio
+                    )
+                # Baselines build their run ids from cfg["run_name"], so the
+                # fold tag has to be injected here too — otherwise their runs
+                # are indistinguishable across folds and the pooling step in
+                # outer_cv.py cannot pick them up.
+                _bl_cfg = cfg
+                if cv_fold is not None:
+                    _bl_cfg = dict(cfg)
+                    _bl_cfg["run_name"] = f"{cfg.get('run_name', 'run')}_f{cv_fold}"
+                run_baselines(
+                    cfg=_bl_cfg,
+                    train_dataset=_bl_train,
+                    val_dataset=_bl_val,
+                    final_test_dataset=final_test_dataset,
+                    save_dir=save_dir,
+                    plots_dir=plots_dir,
+                    results_path=results_path,
+                    header=header,
+                    seeds=[int(s) for s in _seeds],
+                    num_classes=overall_num_classes,
+                    detailed_metrics_fn=_compute_and_save_detailed_metrics,
+                )
+            except Exception as e:
+                print(f"Baseline training skipped: {e}")
+
+        # Cross-run aggregate reporting. Under outer CV each fold sees only its
+        # own slice, so these are deferred and run once by outer_cv.py over the
+        # pooled predictions instead of being rebuilt (and overwritten) per fold.
+        if not run_reports:
+            print("[CV fold %s] complete - aggregate reports deferred to the pooling step." % cv_fold)
+            return
 
         # After all runs, generate summary plots
         _generate_summary_plots(results_path, plots_dir)

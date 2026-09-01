@@ -49,7 +49,8 @@ import pandas as pd
 import seaborn as sns
 
 
-MODEL_TYPE_ORDER = ["SimpleGCN", "TemporalGCN_GRU", "TemporalGAT_GRU", "TemporalAttentionGNN"]
+MODEL_TYPE_ORDER = ["RandomForest", "KerasMLP",
+                    "SimpleGCN", "TemporalGCN_GRU", "TemporalGAT_GRU", "TemporalAttentionGNN"]
 
 
 # ---------------------------------------------------------------------------
@@ -63,9 +64,16 @@ def _parse_params(raw: Any) -> dict:
         return {}
 
 
+BASELINE_TYPES = {"RandomForest", "KerasMLP"}
+
+
 def _classify_run(params: dict) -> str:
     """Same mapping as pipeline/train.py::_model_type_from_cfg."""
     model_type = params.get("model_type")
+    # Non-graph baselines record their display name directly; the flag-based
+    # branch order below only applies to the GNN family.
+    if model_type in BASELINE_TYPES:
+        return model_type
     if model_type == "simple_gcn" or bool(params.get("use_simple_gcn", False)):
         return "SimpleGCN"
     if model_type == "temporal_attention" or bool(params.get("use_temporal_attention", False)):

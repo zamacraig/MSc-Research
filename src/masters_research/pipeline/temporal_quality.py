@@ -127,13 +127,16 @@ def score_label_drift(
         .reset_index()
     )
     timestamps = sorted(ts_node["TimeStamp"].unique())
-    n_classes = int(ts_node[target_col].max()) + 1
+    n_classes = int(ts_node.loc[ts_node[target_col] >= 0, target_col].max()) + 1
 
     # Build class distribution per timestamp
     dists = []
     for ts in timestamps:
-        labels = ts_node.loc[ts_node["TimeStamp"] == ts, target_col].values
-        counts = np.bincount(labels.astype(int), minlength=n_classes).astype(float)
+        labels = ts_node.loc[ts_node["TimeStamp"] == ts, target_col].values.astype(int)
+        labels = labels[labels >= 0]      # -1 = station has no drought index this month
+        counts = np.bincount(labels, minlength=n_classes).astype(float)
+        if counts.sum() == 0:
+            continue
         dists.append(counts / counts.sum())
 
     dists = np.array(dists)  # (T, C)
@@ -398,6 +401,10 @@ def compare_splits(
     """
     labels_a, feats_a = _extract_labels_and_features(split_a)
     labels_b, feats_b = _extract_labels_and_features(split_b)
+    # Unlabelled nodes (sentinel -1) describe no class, so they are excluded
+    # from the label-drift comparison; their features still count as observed.
+    labels_a = np.asarray(labels_a); labels_b = np.asarray(labels_b)
+    labels_a = labels_a[labels_a >= 0]; labels_b = labels_b[labels_b >= 0]
 
     # --- Label distribution ---
     counts_a = np.bincount(labels_a, minlength=num_classes).astype(float)

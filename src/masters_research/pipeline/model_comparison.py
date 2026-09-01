@@ -38,8 +38,10 @@ import seaborn as sns
 # Model registry with (display_name, family, path-in-models-tree).
 # Order here is the plotting order (left -> right).
 MODELS: list[tuple[str, str, str]] = [
-    ("RandomForest",         "baseline", "RandomForest/RandomForest_classification_report.txt"),
-    ("KerasMLP",             "baseline", "Keras/Keras_classification_report.txt"),
+    # Baselines are now trained inside the main pipeline (pipeline/baselines_runner.py),
+    # so their reports live under the same models/<ModelType>/ layout as the GNNs.
+    ("RandomForest",         "baseline", "RandomForest/classification_report.txt"),
+    ("KerasMLP",             "baseline", "KerasMLP/classification_report.txt"),
     ("SimpleGCN",            "gnn",      "SimpleGCN/classification_report.txt"),
     ("TemporalGCN_GRU",      "gnn",      "TemporalGCN_GRU/classification_report.txt"),
     ("TemporalAttentionGNN", "gnn",      "TemporalAttentionGNN/classification_report.txt"),
@@ -119,6 +121,23 @@ def _resolve_models_dir(base_path: Path) -> Path:
     raise FileNotFoundError(f"Could not find models/ under {base_path}.")
 
 
+def _auto_ylim(values, pad: float = 0.06) -> tuple[float, float]:
+    """Pick a y-range that frames the data with a little headroom.
+
+    Always anchors below the smallest bar so nothing is clipped, and never
+    exceeds 1.0 (these are all bounded [0,1] metrics). Falls back to the full
+    range if the values are degenerate.
+    """
+    v = np.asarray([x for x in np.asarray(values, dtype=float) if np.isfinite(x)])
+    if v.size == 0:
+        return 0.0, 1.0
+    lo = max(0.0, float(v.min()) - pad)
+    hi = min(1.0, float(v.max()) + pad)
+    if hi - lo < 0.05:            # degenerate spread
+        return max(0.0, lo - 0.05), min(1.0, hi + 0.05)
+    return lo, hi
+
+
 def _annotate_bars(ax: plt.Axes, fmt: str = "{:.4f}") -> None:
     """Print each bar's numeric value on top of the bar.
 
@@ -168,10 +187,12 @@ def _plot_headline_metrics(df: pd.DataFrame, out_path: Path) -> None:
         tick_label.set_color(FAMILY_COLOURS[row["family"]])
         tick_label.set_fontweight("bold")
 
-    # Zoom the y-axis to the range actually populated by the results so the
-    # tier separation between baselines (~0.90) and GNNs (~0.70–0.85) is
-    # legible without whitespace at the bottom dominating the plot.
-    ax.set_ylim(0.6, 1.0)
+    # Zoom the y-axis to the range actually populated by the results so small
+    # between-model differences stay legible. Derived from the data rather than
+    # hard-coded: a fixed floor silently renders every bar invisible whenever
+    # scores fall below it.
+    _lo, _hi = _auto_ylim(plot_df["value"])
+    ax.set_ylim(_lo, _hi)
     ax.set_ylabel("Score")
     ax.set_xlabel("")
     ax.set_title("Model comparison — headline metrics (weighted averages)")
@@ -211,7 +232,8 @@ def _plot_per_class_f1(df: pd.DataFrame, out_path: Path) -> None:
         tick_label.set_color(FAMILY_COLOURS[row["family"]])
         tick_label.set_fontweight("bold")
 
-    ax.set_ylim(0.0, 1.05)
+    _lo, _hi = _auto_ylim(long["f1"])
+    ax.set_ylim(_lo, _hi)
     ax.set_ylabel("F1-score")
     ax.set_xlabel("")
     ax.set_title("Per-class F1 by model — where each family wins or loses")

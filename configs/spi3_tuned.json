@@ -1,0 +1,84 @@
+{
+  "run_name": "spi3_tuned",
+  "model_type": [
+    "simple_gcn",
+    "temporal_gru",
+    "temporal_attention"
+  ],
+  "epochs": [
+    60
+  ],
+  "lr": [
+    0.0005
+  ],
+  "weight_decay": [
+    0.03
+  ],
+  "hidden_channels": [
+    32,
+    64
+  ],
+  "in_channels": 12,
+  "num_classes": [
+    3
+  ],
+  "train_ratio": 0.8,
+  "test_holdout_ratio": 0.2,
+  "seed": [
+    42,
+    123,
+    456,
+    789,
+    1024
+  ],
+  "device": "cpu",
+  "optimizer": "adam",
+  "scheduler": {
+    "name": "CosineAnnealingLR",
+    "T_max": 60,
+    "eta_min": 1e-05
+  },
+  "early_stopping_patience": 15,
+  "early_stopping_min_delta": 0.001,
+  "save_best": true,
+  "eval_interval": 1,
+  "plot_nodes_per_timestamp": true,
+  "data_path": "Dataset/TransientData/processedData.csv",
+  "processed_data_path": "Dataset/TransientData/processedData.csv",
+  "save_dir": "src/masters_research/artifacts/models",
+  "plots_dir": "src/masters_research/artifacts/plots",
+  "enable_explainability": true,
+  "gnnexplainer_nodes": 5,
+  "gnnexplainer_epochs": 100,
+  "ig_nodes": 5,
+  "ig_steps": 50,
+  "use_attention": false,
+  "gat_heads": 4,
+  "stratified_split": true,
+  "n_cv_folds": 1,
+  "gru_layers": 1,
+  "gcn_layers": 3,
+  "temporal_quality_audit": true,
+  "focal_loss": true,
+  "focal_gamma": 2.0,
+  "label_smoothing": 0.05,
+  "entropy_reg": 0.0,
+  "classifier_l2": 0.001,
+  "input_norm": true,
+  "warmup_epochs": 5,
+  "seasonal_normalization": true,
+  "add_lag_features": true,
+  "use_temporal_attention": false,
+  "use_simple_gcn": false,
+  "temporal_history_len": 10,
+  "temporal_heads": 4,
+  "dropout": 0.2,
+  "grad_clip": 0.5,
+  "use_swa": true,
+  "swa_start_epoch": 20,
+  "swa_lr": 0.0005,
+  "selection_window": 5,
+  "forecast_horizon": 1,
+  "target_type": "spi",
+  "target_window": 3
+}

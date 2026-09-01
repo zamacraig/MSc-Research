@@ -39,7 +39,8 @@ from masters_research.pipeline.compare_reports import (
     _averages_comparison,
 )
 
-MODEL_TYPE_ORDER = ["SimpleGCN", "TemporalGCN_GRU", "TemporalGAT_GRU", "TemporalAttentionGNN"]
+MODEL_TYPE_ORDER = ["RandomForest", "KerasMLP",
+                    "SimpleGCN", "TemporalGCN_GRU", "TemporalGAT_GRU", "TemporalAttentionGNN"]
 
 
 def _parse_params(raw: Any) -> dict:
@@ -49,10 +50,17 @@ def _parse_params(raw: Any) -> dict:
         return {}
 
 
+BASELINE_TYPES = {"RandomForest", "KerasMLP"}
+
+
 def _classify_run(params: dict) -> str:
     """Map a run's hyperparameters to one of the 4 architectures, mirroring the
     branch order in pipeline/train.py::_train_one_fold."""
     model_type = params.get("model_type")
+    # Non-graph baselines record their display name directly; the flag-based
+    # branch order below only applies to the GNN family.
+    if model_type in BASELINE_TYPES:
+        return model_type
     if model_type == "simple_gcn" or bool(params.get("use_simple_gcn", False)):
         return "SimpleGCN"
     if model_type == "temporal_attention" or bool(params.get("use_temporal_attention", False)):
@@ -74,7 +82,14 @@ def _resolve_results_csv(base_path: Path) -> Path:
 
 def _best_run_per_type(df: pd.DataFrame) -> dict[str, pd.Series]:
     df = df.copy()
-    df["_model_type"] = df["params"].apply(lambda raw: _classify_run(_parse_params(raw)))
+    # Prefer the explicit model_type column (written by both the GNN grid and
+    # the baseline runner); fall back to inferring from params for legacy rows.
+    if "model_type" in df.columns and df["model_type"].notna().any():
+        df["_model_type"] = df["model_type"].fillna(
+            df["params"].apply(lambda raw: _classify_run(_parse_params(raw)))
+        )
+    else:
+        df["_model_type"] = df["params"].apply(lambda raw: _classify_run(_parse_params(raw)))
     df["_score"] = pd.to_numeric(df["final_test_f1"], errors="coerce")
     df["_score"] = df["_score"].fillna(pd.to_numeric(df["best_f1"], errors="coerce"))
 

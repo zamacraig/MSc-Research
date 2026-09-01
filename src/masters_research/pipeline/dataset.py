@@ -1,10 +1,29 @@
 import torch
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from datetime import datetime
 from sklearn.preprocessing import MinMaxScaler, LabelEncoder
 from torch_geometric_temporal.signal import DynamicGraphTemporalSignalBatch
 import numpy as np
+
+
+def _parse_timestamps(values) -> pd.Series:
+    """Parse a TimeStamp column into proper datetimes, regardless of storage format.
+
+    The transient dataset has been produced in two different formats over the
+    life of this project: ISO date strings ("2004-11-01") and Unix epoch
+    *seconds* stored as floats (1099267200.0). A bare ``pd.to_datetime`` call
+    silently mis-reads the latter as **nanoseconds**, mapping every row to
+    1970-01-01 — which collapses all rows into a single calendar month and
+    destroys both the seasonal normalisation and the Fourier encodings without
+    raising an error. This helper detects the numeric case and applies
+    ``unit="s"`` so both formats resolve to the same calendar dates.
+    """
+    s = pd.Series(values)
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_datetime(s, unit="s")
+    return pd.to_datetime(s)
 
 
 def _compute_seasonal_stats(df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
@@ -18,7 +37,7 @@ def _compute_seasonal_stats(df: pd.DataFrame, features: list[str]) -> pd.DataFra
     features (see the leak-free pipeline design in Chapter 4 of the thesis).
     """
     tmp = df.copy()
-    tmp["_month"] = pd.to_datetime(tmp["TimeStamp"]).dt.month
+    tmp["_month"] = _parse_timestamps(tmp["TimeStamp"]).dt.month
     return tmp.groupby("_month")[features].agg(["mean", "std"])
 
 
@@ -47,7 +66,7 @@ def _apply_seasonal_normalization(
     df = df.copy()
 
     # Extract month from timestamp for the lookup below.
-    df["_month"] = pd.to_datetime(df["TimeStamp"]).dt.month
+    df["_month"] = _parse_timestamps(df["TimeStamp"]).dt.month
 
     # Fit-on-supplied path (leak-free): use caller-provided stats.
     # Fallback path: compute over the input df (mirrors the pre-fix behaviour).
@@ -128,6 +147,12 @@ def create_temporal_dataset(
     n_classes: int = 5,
     test_holdout_ratio: float = 0.2,
     stratified_split: bool = False,
+    forecast_horizon: int = 1,
+    target_type: str = "feature_mean",
+    target_window: int = 3,
+    base_path=None,
+    cv_fold: int | None = None,
+    n_outer_folds: int = 5,
 ) -> DynamicGraphTemporalSignalBatch:
     """
     Creates a temporal dataset from the final processed dataframe.
@@ -221,8 +246,37 @@ def create_temporal_dataset(
     # -----------------------------------------------------------------
     sorted_ts = sorted(final_df["TimeStamp"].unique())
     n_total_ts = len(sorted_ts)
+    _cv_test_ts: set | None = None
     n_test_ts = max(1, int(round(n_total_ts * test_holdout_ratio)))
-    if stratified_split:
+    if cv_fold is not None:
+        # Rotating outer fold, assigned round-robin WITHIN each calendar month.
+        #
+        # A naive `position % n_folds` rule looks equivalent but is not: calendar
+        # months repeat on a 12-cycle, so whenever gcd(n_folds, 12) != 1 every
+        # occurrence of a given month lands in the same fold. All of that month's
+        # rows then sit on one side of the split, the seasonal reference period
+        # for the other side is empty, and SPI standardisation returns all-NaN.
+        # (n_folds=5 survives only because 5 and 12 are coprime.)
+        #
+        # Cycling within each calendar month instead guarantees every month is
+        # spread evenly across folds for ANY fold count, and still gives each
+        # month exactly one turn in the test set across the full sweep.
+        _fold_dt = _parse_timestamps(pd.Series(sorted_ts))
+        _seen: dict[int, int] = {}
+        _fold_of_position: list[int] = []
+        for _m in _fold_dt.dt.month:
+            _k = _seen.get(int(_m), 0)
+            _seen[int(_m)] = _k + 1
+            _fold_of_position.append(_k % int(n_outer_folds))
+        test_ts_positions = {i for i, f in enumerate(_fold_of_position)
+                             if f == int(cv_fold)}
+        trainval_ts = [ts for i, ts in enumerate(sorted_ts) if i not in test_ts_positions]
+        # Keyed by timestamp VALUE so it survives the successor-drop filtering
+        # applied further down, which removes rows and shifts positions.
+        _cv_test_ts = {ts for i, ts in enumerate(sorted_ts) if i in test_ts_positions}
+        print(f"Outer CV fold {cv_fold}/{n_outer_folds}: "
+              f"{len(test_ts_positions)} test months, {len(trainval_ts)} trainval months.")
+    elif stratified_split:
         # Every-k-th-timestamp scheme — mirrors interleaved_temporal_split.
         step = n_total_ts / n_test_ts
         test_ts_positions = {min(int(i * step), n_total_ts - 1) for i in range(n_test_ts)}
@@ -260,8 +314,41 @@ def create_temporal_dataset(
     # columns. This is the *same-month* composite quality signal — it is not
     # the forecasting label itself, only the raw material the label is built
     # from (see the forward-shift step immediately below).
-    final_df["Target_x_continuous"] = final_df[features_to_scale].mean(axis=1)
-    print("Target_x_continuous recomputed from normalized features (same-month).")
+    _tt = str(target_type).lower()
+    if _tt in ("spi", "spei"):
+        # Standardised drought index computed from the RAW station record, so
+        # the label is derived independently of the model's input features.
+        # This removes the circularity of the feature-mean target, where the
+        # label was a deterministic function of the inputs.
+        from masters_research.pipeline.drought_index import build_index_lookup
+
+        _root = Path(base_path) if base_path is not None else Path(__file__).resolve().parents[3]
+        _ref_ts = pd.to_datetime(pd.Series(trainval_ts))   # leak-free reference period
+        idx_df = build_index_lookup(_root, window=int(target_window),
+                                    use_pet=(_tt == "spei"),
+                                    reference_timestamps=_ref_ts)
+        print(f"{_tt.upper()}-{target_window} target: {len(idx_df)} station-months computed "
+              f"from raw records (reference period = trainval only).")
+
+        _dt = _parse_timestamps(final_df["TimeStamp"])
+        merged = pd.DataFrame({"Compno": final_df["Compno_x"].values, "TimeStamp": _dt.values})
+        merged = merged.merge(idx_df, on=["Compno", "TimeStamp"], how="left")
+        final_df["Target_x_continuous"] = merged["index_value"].values
+
+        # Station-months with no index value (index warm-up, or a station
+        # missing from the raw record that month) are KEPT, not dropped. The
+        # processed frame supplies their input features either way; only the
+        # label is unknown. Dropping them would shrink the node set from one
+        # month to the next, which breaks both the fixed spatial graph and the
+        # GRU hidden state carried across snapshots. They are instead marked
+        # unlabelled below and masked out of the loss and the metrics.
+        n_missing = int(final_df["Target_x_continuous"].isna().sum())
+        print(f"  {n_missing} of {len(final_df)} rows have no index value "
+              f"(warm-up months / stations absent from the raw record); "
+              f"these are kept as unlabelled and masked out of the loss.")
+    else:
+        final_df["Target_x_continuous"] = final_df[features_to_scale].mean(axis=1)
+        print("Target_x_continuous recomputed from normalized features (same-month).")
 
     # -----------------------------------------------------------------
     # Forecasting shift — this study predicts NEXT month's quality category
@@ -272,34 +359,75 @@ def create_temporal_dataset(
     #
     # final_df is an edge-list (one row per station per neighbour-edge per
     # timestamp), so the shift is computed on a deduplicated one-row-per
-    # -station-month table and merged back — a per-row groupby().shift(-1)
-    # would incorrectly shift across duplicate same-month edge rows instead
-    # of across months. The dataset is a fully regular monthly panel (see
-    # the temporal quality audit: node coverage and timestamp regularity are
-    # both perfect), so a plain positional shift within each station's
-    # chronologically-sorted month sequence is safe and exact.
+    # -station-month table and merged back.
+    #
+    # The pairing is done by EXPLICIT CALENDAR MATCHING, not by positional
+    # shift(-1). A positional shift takes "the next row in this station's
+    # sorted sequence", which silently pairs month t with a non-adjacent
+    # month wherever the record has a gap — producing a mislabelled example
+    # that looks like a valid t+1 target. Matching on
+    # `TimeStamp + DateOffset(months=1)` instead means a month with no true
+    # successor yields NaN and is dropped, and it mirrors the equivalent
+    # construction in `baselines/baseline_models.py` exactly, keeping the two
+    # pipelines' labels definitionally identical.
     # -----------------------------------------------------------------
-    print("Building one-month-ahead forecasting target (t -> t+1)...")
-    node_month_targets = (
-        final_df[["Compno_x", "TimeStamp", "Target_x_continuous"]]
-        .drop_duplicates(subset=["Compno_x", "TimeStamp"])
-        .sort_values(["Compno_x", "TimeStamp"])
-    )
-    node_month_targets["Target_x_continuous_forecast"] = (
-        node_month_targets.groupby("Compno_x")["Target_x_continuous"].shift(-1)
-    )
-    final_df = final_df.merge(
-        node_month_targets[["Compno_x", "TimeStamp", "Target_x_continuous_forecast"]],
-        on=["Compno_x", "TimeStamp"], how="left",
-    )
+    if forecast_horizon <= 0:
+        # Nowcasting mode (horizon 0): the label is the CURRENT month's own
+        # category. Retained as an explicit ablation arm — note that under
+        # this setting the target is a near-deterministic function of the
+        # model's own input features, so results are not evidence of
+        # forecasting skill. See the nowcast-vs-forecast discussion.
+        print("Nowcasting mode (forecast_horizon=0): label is the CURRENT month.")
+        final_df["Target_x_continuous_forecast"] = final_df["Target_x_continuous"]
+    else:
+        print(f"Building {forecast_horizon}-month-ahead forecasting target "
+              f"(t -> t+{forecast_horizon}, calendar-matched)...")
+        node_month_targets = (
+            final_df[["Compno_x", "TimeStamp", "Target_x_continuous"]]
+            .drop_duplicates(subset=["Compno_x", "TimeStamp"])
+            .copy()
+        )
+        # Normalise to real datetimes so DateOffset arithmetic is meaningful
+        # for both the ISO-string and Unix-epoch storage formats.
+        node_month_targets["_dt"] = _parse_timestamps(node_month_targets["TimeStamp"])
 
-    # The most recent timestamp has no t+1 for any station and therefore no
-    # valid forecasting label — drop it entirely, mirroring the dropna used
-    # for the equivalent shift in the baseline pipeline (baseline_models.py).
-    n_before = final_df["TimeStamp"].nunique()
-    final_df = final_df.dropna(subset=["Target_x_continuous_forecast"]).reset_index(drop=True)
-    n_after = final_df["TimeStamp"].nunique()
-    print(f"  Dropped final timestamp (no t+1 available): {n_before} -> {n_after} timestamps.")
+        # Right-hand side: the successor month's target, keyed by the month it
+        # is the successor OF (shifted back so it joins onto month t).
+        successor = node_month_targets[["Compno_x", "_dt", "Target_x_continuous"]].copy()
+        successor["_dt"] = successor["_dt"] - pd.DateOffset(months=forecast_horizon)
+        successor = successor.rename(
+            columns={"Target_x_continuous": "Target_x_continuous_forecast"}
+        )
+
+        node_month_targets = node_month_targets.merge(
+            successor, on=["Compno_x", "_dt"], how="left"
+        )
+        final_df = final_df.merge(
+            node_month_targets[["Compno_x", "TimeStamp", "Target_x_continuous_forecast"]],
+            on=["Compno_x", "TimeStamp"], how="left",
+        )
+
+        # Any station-month whose true calendar successor is absent (the final
+        # month of the record, or a month sitting just before a gap) has no
+        # valid forecasting label and is dropped — mirroring the dropna applied
+        # to `Shifted_Target` in the baseline pipeline.
+        # Two different reasons the forecast target can be missing, and they
+        # need opposite treatment:
+        #   (a) the successor MONTH is absent from the record entirely (the
+        #       last month, or a month just before a gap) — no station has a
+        #       label, so the whole snapshot is dropped;
+        #   (b) the successor month exists but that station has no index value
+        #       — the snapshot stays, and this node is simply unlabelled.
+        n_before = final_df["TimeStamp"].nunique()
+        rows_before = len(final_df)
+        _all_dt = set(_parse_timestamps(final_df["TimeStamp"]))
+        _row_dt = _parse_timestamps(final_df["TimeStamp"])
+        has_successor = (_row_dt + pd.DateOffset(months=forecast_horizon)).isin(_all_dt)
+        final_df = final_df.loc[has_successor].reset_index(drop=True)
+        n_after = final_df["TimeStamp"].nunique()
+        print(f"  Calendar-matched t+{forecast_horizon}: {n_before} -> {n_after} timestamps, "
+              f"{rows_before} -> {len(final_df)} rows "
+              f"({rows_before - len(final_df)} dropped for missing successor month).")
 
     # Re-derive the trainval mask against the filtered frame. trainval_ts is
     # a list of timestamp *values* (unaffected by row filtering), so this
@@ -355,13 +483,19 @@ def create_temporal_dataset(
     # now encodes next-month's category, not the current month's — this is
     # the one-line hinge that converts the pipeline from nowcasting to
     # one-step-ahead forecasting.
+    # Rows with no index value carry no label. -1 is the sentinel the training
+    # loop masks on (and torch's standard ignore_index), keeping the node in
+    # the graph as a feature provider for its neighbours while contributing
+    # nothing to the loss or the reported metrics.
+    binned.loc[final_df["Target_x_continuous_forecast"].isna()] = -1
     final_df["Target_x"] = binned.astype(int)
 
     # Report the resulting distribution per partition so the trainval/test
     # split is honest and visible in the training log.
     print("Target discretization complete. Distribution:")
     for label, mask in [("Trainval", trainval_mask), ("Test    ", ~trainval_mask)]:
-        dist = final_df.loc[mask, "Target_x"].value_counts().sort_index()
+        _lab = final_df.loc[mask, "Target_x"]
+        dist = _lab[_lab >= 0].value_counts().sort_index()
         total = int(dist.sum())
         if total == 0:
             continue
@@ -445,8 +579,12 @@ def create_temporal_dataset(
         #   - Day-of-year: finer granularity than monthly
         # This creates a richer representation that prevents the model from 
         # getting stuck in local minima that only fit one season.
-        ts_dt = pd.Timestamp(timestamp) if not isinstance(timestamp, pd.Timestamp) else timestamp
-        
+        # Use the format-aware parser: a bare pd.Timestamp() on a Unix-epoch
+        # float would be read as nanoseconds and collapse every snapshot onto
+        # 1970-01-01, making these encodings constant and information-free.
+        ts_dt = (timestamp if isinstance(timestamp, pd.Timestamp)
+                 else _parse_timestamps([timestamp]).iloc[0])
+
         # Day of year (1-366) for finer temporal resolution
         day_of_year = ts_dt.timetuple().tm_yday
         year_progress = day_of_year / 365.25  # Normalized to [0, 1]
@@ -466,14 +604,33 @@ def create_temporal_dataset(
         )
         x = torch.cat([x, temporal_enc], dim=1)   # [num_nodes, base_features + lag_features + 4]
 
-        # Edge indices — must reference the encoded 0..N-1 node ids, matching
-        # the row order of `x` above and `targets_tensor` below.
-        edge_indices = torch.tensor(df_timestamp[["Compno_x_encoded", "Compno_y_encoded"]].values.T, dtype=torch.long)
+        # Edge indices must address rows of `x`, which holds only the stations
+        # reporting THIS month. `Compno_x_encoded` is a global 0..N-1 code fit
+        # once over every station, so it is only a valid row index when every
+        # station is present. Targets such as SPI are defined solely where the
+        # raw record exists, leaving months with a subset of stations — so the
+        # global codes are remapped to snapshot-local positions here.
+        present = node_features["Compno_x_encoded"].to_numpy()
+        local_of = {int(g): i for i, g in enumerate(present)}
+
+        src_global = df_timestamp["Compno_x_encoded"].to_numpy()
+        dst_global = df_timestamp["Compno_y_encoded"].to_numpy()
+        # An edge survives only if BOTH endpoints reported this month; a
+        # neighbour that is absent has no feature row to aggregate from.
+        keep = np.isin(src_global, present) & np.isin(dst_global, present)
+
+        edge_indices = torch.tensor(
+            np.stack([
+                np.array([local_of[int(v)] for v in src_global[keep]], dtype=np.int64),
+                np.array([local_of[int(v)] for v in dst_global[keep]], dtype=np.int64),
+            ]),
+            dtype=torch.long,
+        )
 
         # Edge weights: INVERSE distance so closer stations have HIGHER influence
         # Using exp(-distance) for smooth decay; epsilon prevents division by zero
-        distances = df_timestamp["distance_km"].values
-        edge_weights = torch.tensor(np.exp(-distances), dtype=torch.float)
+        distances = df_timestamp["distance_km"].values[keep]
+        edge_weights = torch.tensor(np.exp(distances * -1.0), dtype=torch.float)
 
         # Targets - must match node_features extraction (one per node, same order)
         targets_df = (
@@ -491,7 +648,7 @@ def create_temporal_dataset(
         )
 
         # Generate batches (assuming each timestamp is a separate batch)
-        batch = torch.tensor([i for i in range(len(df_timestamp))], dtype=torch.long)
+        batch = torch.arange(x.size(0), dtype=torch.long)
 
         snapshot_timestamp = torch.FloatTensor([timestamp_numeric])
 
@@ -512,6 +669,13 @@ def create_temporal_dataset(
         == len(all_batches)
         == len(timestamps_list)
     ), "Temporal dimension inconsistency."
+
+    # Per-snapshot test flag, aligned with the snapshot lists above. Carrying it
+    # on the dataset lets interleaved_temporal_split reproduce the split exactly
+    # instead of recomputing it — the timestamps tensor is float32 and cannot
+    # round-trip a Unix epoch, so re-deriving months from it would be unsafe.
+    _cv_is_test = ([bool(ts in _cv_test_ts) for ts in timestamps]
+                   if _cv_test_ts is not None else None)
 
     print("Temporal dataset creation complete.")
 
@@ -545,6 +709,7 @@ def create_temporal_dataset(
         timestamps=timestamps_list,
     )
     dataset.feature_names = feature_names
+    dataset.cv_is_test = _cv_is_test
     return dataset
 
 
@@ -571,6 +736,7 @@ def stratified_temporal_signal_split(dataset: DynamicGraphTemporalSignalBatch, t
     for i in range(total):
         snap = dataset[i]
         lbls = snap.y.cpu().numpy().astype(int)
+        lbls = lbls[lbls >= 0]      # unlabelled nodes carry no class signature
         counts = np.bincount(lbls, minlength=num_classes if num_classes else 0)
         snapshot_class_counts.append(counts)
 
@@ -668,7 +834,8 @@ def stratified_temporal_signal_split(dataset: DynamicGraphTemporalSignalBatch, t
 
 
 def interleaved_temporal_split(
-    dataset: DynamicGraphTemporalSignalBatch, train_ratio: float = 0.8
+    dataset: DynamicGraphTemporalSignalBatch, train_ratio: float = 0.8,
+    cv_fold: int | None = None, n_outer_folds: int = 5,
 ):
     """
     Systematic (interleaved) outer split that preserves the full temporal class distribution.
@@ -681,6 +848,38 @@ def interleaved_temporal_split(
     snapshots are used as the test set.
     """
     total = dataset.snapshot_count
+    if cv_fold is not None:
+        # Read the assignment recorded when the dataset was built, rather than
+        # recomputing it. The two must agree exactly -- if they ever diverged,
+        # the scalers and bin edges would be fit on months that end up in this
+        # fold's test set, silently reintroducing the leak this design removes.
+        flags = getattr(dataset, "cv_is_test", None)
+        if flags is None:
+            raise ValueError(
+                "interleaved_temporal_split(cv_fold=...) needs a dataset built by "
+                "create_temporal_dataset(cv_fold=...); this one carries no fold "
+                "assignment, so the split could not be guaranteed leak-free."
+            )
+        if len(flags) != total:
+            raise ValueError(
+                f"Fold assignment covers {len(flags)} snapshots but the dataset has "
+                f"{total}; refusing to split on a stale assignment."
+            )
+        test_idxs = [i for i, is_test in enumerate(flags) if is_test]
+        test_set = set(test_idxs)
+        train_idxs = [i for i in range(total) if i not in test_set]
+
+        def _subset_cv(idxs):
+            return DynamicGraphTemporalSignalBatch(
+                edge_indices=[dataset.edge_indices[i] for i in idxs],
+                edge_weights=[dataset.edge_weights[i] for i in idxs],
+                features=[dataset.features[i] for i in idxs],
+                targets=[dataset.targets[i] for i in idxs],
+                batches=[dataset.batches[i] for i in idxs],
+                timestamps=[dataset.timestamps[i] for i in idxs],
+            )
+        return _subset_cv(train_idxs), _subset_cv(test_idxs)
+
     test_count = max(1, int(round(total * (1.0 - train_ratio))))
     step = total / test_count  # float step so positions spread evenly
     test_idxs: list[int] = sorted({min(int(i * step), total - 1) for i in range(test_count)})

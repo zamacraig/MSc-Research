@@ -285,6 +285,10 @@ def _rebuild_splits(base_path: Path, cfg: dict):
         # stats / tercile bin edges. Must mirror the outer split.
         test_holdout_ratio=float(cfg.get("test_holdout_ratio", 0.2)),
         stratified_split=bool(cfg.get("stratified_split", False)),
+        forecast_horizon=int(cfg.get("forecast_horizon", 1)),
+        target_type=str(cfg.get("target_type", "feature_mean")),
+        target_window=int(cfg.get("target_window", 3)),
+        base_path=base_path,
     )
     test_holdout = float(cfg.get("test_holdout_ratio", 0.2))
     # Match the outer split style used by the GNN pipeline: interleaved if
