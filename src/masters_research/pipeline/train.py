@@ -26,10 +26,7 @@ except Exception:
     Explainer = None
     GNNExplainer = None
     ModelConfig = None
-try:
-    from captum.attr import IntegratedGradients
-except Exception:
-    IntegratedGradients = None
+from masters_research.pipeline.integrated_gradients import integrated_gradients
 
 from masters_research.data import TemporalDataLoader
 from masters_research.pipeline.dataset import create_temporal_dataset
@@ -1735,8 +1732,8 @@ def main(base_path: Path, config_path: Path = None, cv_fold: int | None = None,
                 except Exception as e:
                     print(f"GNNExplainer generation failed: {e}")
 
-            # === Explainability: Captum Integrated Gradients ===
-            if bool(cfg_run.get("enable_explainability", cfg.get("enable_explainability", True))) and IntegratedGradients is not None:
+            # === Explainability: Integrated Gradients ===
+            if bool(cfg_run.get("enable_explainability", cfg.get("enable_explainability", True))):
                 print("Computing Integrated Gradients on node features...")
                 try:
                     test_snapshot = val_dataset[0]
@@ -1757,21 +1754,27 @@ def main(base_path: Path, config_path: Path = None, cv_fold: int | None = None,
 
                     # Compute IG for every class to ensure outputs exist for all classes
                     per_class_attr = {c: [] for c in range(num_classes_cfg)}
+                    # Each interpolation step is a separate forward pass on the real
+                    # [num_nodes, F] snapshot (see pipeline/integrated_gradients.py);
+                    # captum's stacked-batch evaluation is not valid for these models.
+                    ig_deltas: list[float] = []
                     for idx in node_indices:
-                        def forward_node(x):
-                            result = model(x, test_snapshot.edge_index, edge_weight_src)
-                            logits = result[0] if isinstance(result, tuple) else result
-                            return logits[idx].unsqueeze(0)
-
-                        ig = IntegratedGradients(forward_node)
                         for cls in range(num_classes_cfg):
-                            attributions = ig.attribute(
-                                inputs=test_snapshot.x.clone().detach().requires_grad_(True),
-                                target=cls,
-                                n_steps=ig_steps
+                            attributions, ig_delta = integrated_gradients(
+                                model,
+                                test_snapshot.x,
+                                test_snapshot.edge_index,
+                                edge_weight_src,
+                                node_idx=idx,
+                                target_class=cls,
+                                n_steps=ig_steps,
                             )
+                            ig_deltas.append(abs(ig_delta))
                             attr_vec = attributions[idx].detach().cpu().numpy()
                             per_class_attr[cls].append(attr_vec)
+                    if ig_deltas:
+                        print(f"  IG completeness residual: mean |delta| = {np.mean(ig_deltas):.4f}, "
+                              f"max = {np.max(ig_deltas):.4f}")
 
                     # Aggregate per-class attributions
                     all_class_arrays: list[np.ndarray] = []
