@@ -84,6 +84,17 @@ def load_and_preprocess_data(base_path: str = "."):
         ["ComputerNo", "Latitude", "Longitude", "Altitude"]
     ].apply(pd.to_numeric, errors="coerce")
 
+    # One metadata row per station, and only stations that have an observation
+    # file. StationsData.csv lists identifiers (e.g. the superseded Brandvlei A /
+    # Van Wyksvlei A records) and repeats at least one station; keeping them would
+    # add nodes that never report (filled entirely by imputation) and duplicate
+    # every edge touching the repeated station.
+    node_df = node_df.drop_duplicates(subset="ComputerNo", keep="first")
+    with_data = attribute_df["Compno"].dropna().astype(int).unique()
+    n_meta = len(node_df)
+    node_df = node_df[node_df["ComputerNo"].isin(with_data)].reset_index(drop=True)
+    print(f"      Station metadata: {n_meta} unique IDs, {len(node_df)} with observation files kept.")
+
     # Normalize feature columns before computing the target so that every feature
     # contributes equally to the composite mean (not dominated by high-magnitude
     # columns such as Humidity or Rainfall).

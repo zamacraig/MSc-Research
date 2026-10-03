@@ -8,12 +8,14 @@ with Bonferroni-corrected p-values.
 
 Inputs
 ------
-GNN predictions come from the ``test_probs.npz`` files already saved by
-:mod:`pipeline.train` in each run directory — no GNN retrain is required,
-because the same 207-sample validation set is used deterministically across
-all GNN runs. Baseline (Random Forest, Keras MLP) predictions are trained
-fresh here on the *same* seasonally-normalised processed data as the GNNs
-so that every model's prediction vector is aligned sample-by-sample.
+Every model's held-out test predictions come from the ``test_probs.npz`` file
+saved in its best-run directory: the graph models by :mod:`pipeline.train` and
+the Random Forest / Keras MLP baselines by :mod:`pipeline.baselines_runner`,
+which train inside the same experiment on the same features, partitions and
+t+1 label. Nothing is retrained here, so every model's prediction vector is
+aligned sample-by-sample and the baselines carry exactly the settings
+reported in the thesis. The best run of each model is chosen on *validation*
+F1, never on test F1, so the test set is not used for model selection.
 
 Outputs
 -------
@@ -35,16 +37,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import torch
 from scipy.stats import chi2 as chi2_dist
-from sklearn.ensemble import RandomForestClassifier
-from torch_geometric_temporal.signal import temporal_signal_split
-
-from masters_research.pipeline.dataset import (
-    create_temporal_dataset,
-    interleaved_temporal_split,
-    stratified_temporal_signal_split,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -53,32 +46,39 @@ from masters_research.pipeline.dataset import (
 
 def _find_best_run_dir(models_dir: Path, model_type: str, df: pd.DataFrame) -> Optional[Path]:
     """Return the on-disk directory of the best run for a given model type,
-    ranked by final_test_f1 then best_f1 (matches model_type_report logic)."""
+    ranked by validation F1 (best_f1, then val_f1)."""
     sub = df[df["model_type"] == model_type].copy() if "model_type" in df.columns else df.copy()
     if sub.empty:
         return None
-    for col in ("final_test_f1", "best_f1", "val_f1"):
+    for col in ("best_f1", "val_f1"):
         if col in sub.columns:
             sub[col] = pd.to_numeric(sub[col], errors="coerce")
-    sort_cols = [c for c in ("final_test_f1", "best_f1", "val_f1") if c in sub.columns]
+    # Select on validation performance only; ranking on final_test_f1 would
+    # let the held-out test set choose which run is reported.
+    sort_cols = [c for c in ("best_f1", "val_f1") if c in sub.columns]
     sub = sub.sort_values(sort_cols, ascending=[False] * len(sort_cols))
     best = sub.iloc[0]
     run_dir = models_dir / model_type / str(best["run_id"])
     return run_dir if run_dir.exists() else None
 
 
-def _load_gnn_predictions(models_dir: Path, df: pd.DataFrame) -> dict:
-    """Return {display_name: (labels, preds)} for each GNN architecture whose
+MODEL_FOLDERS = [
+    ("RandomForest", "RandomForest"),
+    ("KerasMLP", "KerasMLP"),
+    ("SimpleGCN", "SimpleGCN"),
+    ("TemporalGCN_GRU", "TemporalGCN_GRU"),
+    ("TemporalAttentionGNN", "TemporalAttentionGNN"),
+]
+
+
+def _load_predictions(models_dir: Path, df: pd.DataFrame) -> dict:
+    """Return {display_name: (labels, preds)} for each of the five models whose
     best-run has a test_probs.npz on disk. Labels must match across models
-    (deterministic val split) — an assertion is raised otherwise so the
+    (deterministic outer split) — an assertion is raised otherwise so the
     caller notices a split-config drift immediately."""
     out: dict = {}
     canonical_labels: Optional[np.ndarray] = None
-    for display, folder in [
-        ("SimpleGCN", "SimpleGCN"),
-        ("TemporalGCN_GRU", "TemporalGCN_GRU"),
-        ("TemporalAttentionGNN", "TemporalAttentionGNN"),
-    ]:
+    for display, folder in MODEL_FOLDERS:
         run_dir = _find_best_run_dir(models_dir, folder, df)
         if run_dir is None:
             print(f"[{display}] no best-run directory found — skipping.")
@@ -96,67 +96,13 @@ def _load_gnn_predictions(models_dir: Path, df: pd.DataFrame) -> dict:
             canonical_labels = labels
         elif not np.array_equal(labels, canonical_labels):
             raise ValueError(
-                f"[{display}] label vector disagrees with the first-loaded GNN. "
+                f"[{display}] label vector disagrees with the first-loaded model. "
                 f"McNemar requires identical test samples across compared models. "
                 f"Check that all best-runs used the same outer split and train_ratio."
             )
         out[display] = (labels, preds)
         print(f"[{display}] loaded {len(preds)} predictions from {run_dir.name}")
     return out
-
-
-# ---------------------------------------------------------------------------
-# Baseline training on the same processed data / same split
-# ---------------------------------------------------------------------------
-
-def _flatten_snapshots(dataset) -> tuple[np.ndarray, np.ndarray]:
-    """Concatenate every snapshot's (nodes, features) block into a single
-    tabular matrix so sklearn/Keras models see (station-month, feature) rows.
-    Mirrors the flatten used in pipeline/learning_curve.py."""
-    xs, ys = [], []
-    n = getattr(dataset, "snapshot_count", None) or len(dataset)
-    for i in range(n):
-        snap = dataset[i]
-        xs.append(snap.x.detach().cpu().numpy())
-        ys.append(snap.y.detach().cpu().numpy().astype(int))
-    return np.concatenate(xs, axis=0), np.concatenate(ys, axis=0)
-
-
-def _train_rf(train_ds, test_ds, seed: int) -> tuple[np.ndarray, np.ndarray]:
-    X_tr, y_tr = _flatten_snapshots(train_ds)
-    X_te, y_te = _flatten_snapshots(test_ds)
-    rf = RandomForestClassifier(
-        n_estimators=200, max_depth=None, min_samples_leaf=2,
-        random_state=seed, n_jobs=-1,
-    )
-    rf.fit(X_tr, y_tr)
-    return y_te, rf.predict(X_te).astype(int)
-
-
-def _train_mlp(train_ds, test_ds, seed: int, num_classes: int, epochs: int = 60) -> tuple[np.ndarray, np.ndarray]:
-    import os
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-    import tensorflow as tf
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import Dense, Dropout, BatchNormalization, Input
-    from tensorflow.keras.utils import to_categorical
-
-    tf.keras.utils.set_random_seed(seed)
-    X_tr, y_tr = _flatten_snapshots(train_ds)
-    X_te, y_te = _flatten_snapshots(test_ds)
-    y_tr_1h = to_categorical(y_tr, num_classes=num_classes)
-    model = Sequential([
-        Input(shape=(X_tr.shape[1],)),
-        Dense(128, activation="relu"), BatchNormalization(), Dropout(0.3),
-        Dense(64, activation="relu"), BatchNormalization(), Dropout(0.3),
-        Dense(32, activation="relu"), BatchNormalization(),
-        Dense(32, activation="relu"),
-        Dense(num_classes, activation="softmax"),
-    ])
-    model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
-    model.fit(X_tr, y_tr_1h, epochs=epochs, batch_size=32, verbose=0, validation_split=0.1)
-    preds = np.argmax(model.predict(X_te, verbose=0), axis=1).astype(int)
-    return y_te, preds
 
 
 # ---------------------------------------------------------------------------
@@ -268,76 +214,11 @@ def _to_latex_table(pair_results: list[dict], caption: str, label: str) -> str:
 # Data-setup helpers — must mirror the training pipeline exactly
 # ---------------------------------------------------------------------------
 
-def _rebuild_splits(base_path: Path, cfg: dict):
-    """Recreate the exact outer + inner split that every GNN best-run used.
-
-    Kept deterministic (no random seed dependence) so the baselines see the
-    same 207-sample validation set the GNNs did.
-    """
-    data_path = base_path / cfg.get("data_path", "Dataset/TransientData/processedData.csv")
-    df = pd.read_csv(data_path)
-    dataset = create_temporal_dataset(
-        df,
-        seasonal_normalization=cfg.get("seasonal_normalization", True),
-        add_lag_features=cfg.get("add_lag_features", True),
-        n_classes=int(cfg.get("num_classes", 3)),
-        # Leak-free preprocessing — trainval-only fit for scaler / seasonal
-        # stats / tercile bin edges. Must mirror the outer split.
-        test_holdout_ratio=float(cfg.get("test_holdout_ratio", 0.2)),
-        stratified_split=bool(cfg.get("stratified_split", False)),
-        forecast_horizon=int(cfg.get("forecast_horizon", 1)),
-        target_type=str(cfg.get("target_type", "feature_mean")),
-        target_window=int(cfg.get("target_window", 3)),
-        base_path=base_path,
-    )
-    test_holdout = float(cfg.get("test_holdout_ratio", 0.2))
-    # Match the outer split style used by the GNN pipeline: interleaved if
-    # stratified_split is on, otherwise chronological.
-    if bool(cfg.get("stratified_split", False)):
-        trainval, _outer_test = interleaved_temporal_split(dataset, train_ratio=1.0 - test_holdout)
-    else:
-        trainval, _outer_test = temporal_signal_split(dataset, train_ratio=1.0 - test_holdout)
-
-    inner_ratio = float(cfg.get("train_ratio", 0.8))
-    if bool(cfg.get("stratified_split", False)):
-        train_ds, val_ds = stratified_temporal_signal_split(
-            trainval, train_ratio=inner_ratio,
-            num_classes=int(cfg.get("num_classes", 3)),
-        )
-    else:
-        train_ds, val_ds = temporal_signal_split(trainval, train_ratio=inner_ratio)
-    return train_ds, val_ds
-
-
-def _guess_best_run_cfg(models_dir: Path, df: pd.DataFrame) -> dict:
-    """Use the params column of any best-run to seed the split reconstruction.
-    All three GNN best-runs should share the split-relevant fields
-    (seasonal_normalization, add_lag_features, test_holdout_ratio,
-    stratified_split, train_ratio) — if they don't, the ValueError raised
-    later by _load_gnn_predictions will make the misalignment obvious."""
-    for model_type in ("SimpleGCN", "TemporalGCN_GRU", "TemporalAttentionGNN"):
-        run_dir = _find_best_run_dir(models_dir, model_type, df)
-        if run_dir is None:
-            continue
-        try:
-            info = (run_dir.parent / "best_run_info.txt").read_text() if (run_dir.parent / "best_run_info.txt").exists() else ""
-        except Exception:
-            info = ""
-        row = df[df["run_id"] == run_dir.name]
-        if not row.empty and "params" in row.columns:
-            try:
-                params = json.loads(row.iloc[0]["params"])
-                return params
-            except Exception:
-                pass
-    return {}
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main(base_path: Path | str | None = None, seed: int = 42) -> Path:
+def main(base_path: Path | str | None = None) -> Path:
     base_path = Path(base_path or Path(__file__).resolve().parents[3]).resolve()
     models_dir = base_path / "src" / "masters_research" / "artifacts" / "models"
     plots_dir = base_path / "src" / "masters_research" / "artifacts" / "plots"
@@ -348,62 +229,25 @@ def main(base_path: Path | str | None = None, seed: int = 42) -> Path:
         raise FileNotFoundError(f"grid_results.csv missing at {results_csv}")
     df = pd.read_csv(results_csv)
 
-    # --- GNN predictions (no retrain, load from disk) ---
-    gnn_preds = _load_gnn_predictions(models_dir, df)
-    if not gnn_preds:
+    # --- Predictions for all five models (load from disk, no retraining) ---
+    all_model_preds = _load_predictions(models_dir, df)
+    if not all_model_preds:
         raise RuntimeError(
-            "No GNN test_probs.npz files were found. Retrain any of the GNN "
-            "architectures with enable_explainability: true to generate them."
+            "No test_probs.npz files were found. Run the training pipeline "
+            "(graph models and baselines) to generate them."
         )
+    missing = [name for name, _ in MODEL_FOLDERS if name not in all_model_preds]
+    if missing:
+        print(f"WARNING: no predictions found for {missing}; comparisons that need "
+              f"them will be skipped.")
 
-    # Canonical shared labels for the validation set every GNN best-run used.
-    canonical_labels = next(iter(gnn_preds.values()))[0]
-    n_val = len(canonical_labels)
+    # Canonical shared labels for the held-out test set every model used.
+    canonical_labels = next(iter(all_model_preds.values()))[0]
+    n_test = len(canonical_labels)
     num_classes = int(canonical_labels.max()) + 1
-    print(f"Shared test/val set: {n_val} samples, {num_classes} classes.\n")
+    print(f"Shared held-out test set: {n_test} samples, {num_classes} classes.\n")
 
-    # --- Baseline training on identical splits ---
-    cfg = _guess_best_run_cfg(models_dir, df)
-    # Fall back to sensible defaults if params were unparseable.
-    cfg.setdefault("seasonal_normalization", True)
-    cfg.setdefault("add_lag_features", True)
-    cfg.setdefault("test_holdout_ratio", 0.2)
-    cfg.setdefault("train_ratio", 0.8)
-    cfg.setdefault("stratified_split", False)
-    cfg.setdefault("num_classes", num_classes)
-    cfg.setdefault("data_path", "Dataset/TransientData/processedData.csv")
-
-    train_ds, val_ds = _rebuild_splits(base_path, cfg)
-    n_val_local = val_ds.snapshot_count * val_ds[0].x.shape[0]
-    if n_val_local != n_val:
-        raise ValueError(
-            f"Split reconstruction produced {n_val_local} validation samples but "
-            f"the GNN best-runs used {n_val}. Check that "
-            f"stratified_split / train_ratio / test_holdout_ratio in the "
-            f"best-run's params match the reconstruction defaults."
-        )
-
-    print("Training RandomForest on the same trainval pool...")
-    y_rf, rf_preds = _train_rf(train_ds, val_ds, seed=seed)
-    print(f"RandomForest       accuracy = {(rf_preds == y_rf).mean():.4f}")
-
-    print("Training Keras MLP on the same trainval pool...")
-    y_mlp, mlp_preds = _train_mlp(train_ds, val_ds, seed=seed, num_classes=num_classes)
-    print(f"KerasMLP           accuracy = {(mlp_preds == y_mlp).mean():.4f}")
-
-    # Alignment guard: baseline labels must match the GNN canonical labels
-    # sample-for-sample, otherwise the McNemar tests are meaningless.
-    if not np.array_equal(y_rf, canonical_labels):
-        raise ValueError(
-            "RandomForest label vector does not match the GNN canonical labels — "
-            "the reconstructed split differs from the one used by the GNN pipeline."
-        )
-
-    all_preds = {
-        "RandomForest": rf_preds,
-        "KerasMLP": mlp_preds,
-        **{k: v[1] for k, v in gnn_preds.items()},
-    }
+    all_preds = {k: v[1] for k, v in all_model_preds.items()}
 
     # Persist every model's predictions plus the shared labels so any
     # downstream analysis can reproduce the significance tests from disk.

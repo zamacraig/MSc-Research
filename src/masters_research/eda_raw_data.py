@@ -433,7 +433,11 @@ def analyse_modelling_balance() -> pd.DataFrame | None:
 
     proc = pd.read_csv(proc_path)
     nodes = proc[["TimeStamp", "Compno_x", "Target_x"]].drop_duplicates().copy()
-    nodes["Year"] = pd.to_datetime(nodes["TimeStamp"], unit="s").dt.year
+    ts = nodes["TimeStamp"]
+    if pd.api.types.is_numeric_dtype(ts):
+        nodes["Year"] = pd.to_datetime(ts, unit="s").dt.year
+    else:
+        nodes["Year"] = pd.to_datetime(ts).dt.year
     nodes["Target_x"] = nodes["Target_x"].astype(int)
 
     n_stations = nodes["Compno_x"].nunique()
