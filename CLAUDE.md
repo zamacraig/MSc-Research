@@ -38,6 +38,11 @@ src/masters_research/
   models/       # 4 architectures: SimpleGCNClassifier, TemporalSpatialNodeClassifier (GCN+GRU),
                 #                  TemporalSpatialAttentionNodeClassifier, TemporalAttentionGNN (GAT + selective attention)
   pipeline/     # train.py (large — training loop, grid search, explainability),
+                # block_bootstrap.py (month-block bootstrap of every model pair; runs at the end of outer_cv.py),
+                # error_analysis.py (error types, dry<->wet reversals, class-change/season/station/fold/collapsed-run breakdowns;
+                #   runs automatically at the end of outer_cv.py and of a single-split train.py run),
+                # station_report.py (weighted F1 of every model per station; called from error_analysis.py),
+                # training_curves.py (per-epoch / per-tree train vs val curves for every run),
                 # temporal_quality.py (5-dim dataset quality audit),
                 # dataset.py, evaluate_best.py, compare_reports.py, model_type_report.py
   baselines/    # baseline_models.py — Random Forest, GBDT, SVM comparisons

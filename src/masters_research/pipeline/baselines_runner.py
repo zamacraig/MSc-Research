@@ -38,6 +38,8 @@ import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score
 
+from masters_research.pipeline import training_curves
+
 BASELINE_MODEL_TYPES = ["RandomForest", "KerasMLP"]
 
 
@@ -72,7 +74,7 @@ def flatten_snapshots(dataset) -> tuple[np.ndarray, np.ndarray]:
 # Individual baseline fits
 # ---------------------------------------------------------------------------
 
-def _fit_random_forest(X_tr, y_tr, seed, cfg):
+def _fit_random_forest(X_tr, y_tr, seed, cfg, X_val=None, y_val=None, history=None):
     rf = RandomForestClassifier(
         n_estimators=int(cfg.get("rf_n_estimators", 200)),
         max_depth=cfg.get("rf_max_depth", None),
@@ -82,10 +84,12 @@ def _fit_random_forest(X_tr, y_tr, seed, cfg):
         n_jobs=-1,
     )
     rf.fit(X_tr, y_tr)
+    if history is not None and X_val is not None:
+        history.extend(training_curves.random_forest_history(rf, X_tr, y_tr, X_val, y_val))
     return rf, lambda m, X: (m.predict(X).astype(int), m.predict_proba(X))
 
 
-def _fit_keras_mlp(X_tr, y_tr, seed, cfg, num_classes):
+def _fit_keras_mlp(X_tr, y_tr, seed, cfg, num_classes, X_val=None, y_val=None, history=None):
     """Lazy-import Keras so a missing TensorFlow install only disables this
     one baseline rather than breaking the whole training run."""
     import os
@@ -113,7 +117,12 @@ def _fit_keras_mlp(X_tr, y_tr, seed, cfg, num_classes):
         X_tr, to_categorical(y_tr, num_classes=num_classes),
         epochs=int(cfg.get("mlp_epochs", 100)),
         batch_size=int(cfg.get("mlp_batch_size", 64)),
-        verbose=0, validation_split=0.1,
+        # No validation_split: Keras would silently hold back the last 10% of the
+        # training rows, so the MLP would train on less data than the RF and GNNs.
+        verbose=0,
+        # Learning-curve logging only; validation never feeds back into training.
+        callbacks=([training_curves.keras_history_callback(X_tr, y_tr, X_val, y_val, history)]
+                   if history is not None and X_val is not None else None),
     )
 
     def predict(m, X):
@@ -157,9 +166,10 @@ def run_baselines(
     print(f"Tabular shapes  train={X_tr.shape}  val={X_val.shape}  test={X_test.shape}")
     print("Same features, same splits, same t+1 label as the GNN runs above.")
 
+    record_curves = bool(cfg.get("record_training_curves", True))
     builders = {
-        "RandomForest": lambda s: _fit_random_forest(X_tr, y_tr, s, cfg),
-        "KerasMLP": lambda s: _fit_keras_mlp(X_tr, y_tr, s, cfg, num_classes),
+        "RandomForest": lambda s, h: _fit_random_forest(X_tr, y_tr, s, cfg, X_val, y_val, h),
+        "KerasMLP": lambda s, h: _fit_keras_mlp(X_tr, y_tr, s, cfg, num_classes, X_val, y_val, h),
     }
 
     for model_type in BASELINE_MODEL_TYPES:
@@ -171,8 +181,9 @@ def run_baselines(
             run_plots_dir.mkdir(parents=True, exist_ok=True)
 
             start = time.time()
+            history = [] if record_curves else None
             try:
-                model, predict = builders[model_type](seed)
+                model, predict = builders[model_type](seed, history)
             except Exception as e:
                 print(f"  [{model_type} seed={seed}] SKIPPED: {e}")
                 continue
@@ -187,6 +198,12 @@ def run_baselines(
             test_f1 = float(f1_score(y_test, test_preds, average="weighted"))
             print(f"  [{model_type:13s} seed={seed:5d}] "
                   f"val_f1={val_f1:.4f}  test_f1={test_f1:.4f}  ({duration:.1f}s)")
+
+            if history:
+                training_curves.save_run_history(
+                    history, run_models_dir, run_plots_dir, title=f"{model_type} - {run_id}",
+                    x_label="Trees" if model_type == "RandomForest" else "Epoch",
+                )
 
             # Same per-run artefacts a GNN run produces.
             detailed_metrics_fn(

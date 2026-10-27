@@ -150,6 +150,15 @@ def main(base_path: Path, config_path: Path | None = None) -> None:
     models_dir = Path(cfg.get("save_dir", default_models))
     models_dir = models_dir if models_dir.is_absolute() else (base_path / models_dir)
 
+    try:
+        from masters_research.pipeline.training_curves import aggregate_curves
+        default_plots = base_path / "src" / "masters_research" / "artifacts" / "plots"
+        plots_dir = Path(cfg.get("plots_dir", default_plots))
+        plots_dir = plots_dir if plots_dir.is_absolute() else (base_path / plots_dir)
+        aggregate_curves(models_dir, plots_dir, run_prefix=run_prefix)
+    except Exception as e:
+        print(f"Learning-curve aggregation skipped: {e}")
+
     pooled = _pool_by_model_type(models_dir, run_prefix)
     if not pooled:
         print("\nNo pooled predictions found — nothing to summarise.")
@@ -203,3 +212,31 @@ def main(base_path: Path, config_path: Path | None = None) -> None:
         pair_csv = models_dir / f"{run_prefix}_outer_cv_mcnemar.csv"
         pd.DataFrame(pairs).to_csv(pair_csv, index=False)
         print(f"\nPairwise tests written to: {pair_csv}")
+
+    # ---------------- dependence-aware comparison ----------------
+    # McNemar treats station-months as independent. Resampling whole calendar
+    # months in circular blocks keeps neighbouring stations, consecutive months and
+    # overlapping SPI-3 windows together, so these intervals are the ones to quote.
+    try:
+        from masters_research.pipeline.block_bootstrap import main as run_block_bootstrap
+        kwargs = {}
+        if "bootstrap_blocks" in cfg:
+            kwargs["blocks"] = tuple(int(b) for b in cfg["bootstrap_blocks"])
+        if "bootstrap_resamples" in cfg:
+            kwargs["n_boot"] = int(cfg["bootstrap_resamples"])
+        if "bootstrap_seed" in cfg:
+            kwargs["seed"] = int(cfg["bootstrap_seed"])
+        bb_csv = run_block_bootstrap(base_path, run_name=run_prefix, cfg=cfg, models_dir=models_dir,
+                                     n_folds=n_folds, **kwargs)
+        print(f"Block-bootstrap comparison written to: {bb_csv}")
+    except Exception as e:
+        print(f"Block bootstrap skipped: {e}")
+
+    # ---------------- error analysis ----------------
+    # Always run on the pooled held-out predictions: error types, reversals of dry
+    # and wet, class-change and seasonal breakdowns, stations, folds, collapsed runs.
+    try:
+        from masters_research.pipeline.error_analysis import run_error_analysis
+        run_error_analysis(base_path, cfg, models_dir, run_prefix, n_folds)
+    except Exception as e:
+        print(f"Error analysis skipped: {e}")

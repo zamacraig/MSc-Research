@@ -228,6 +228,10 @@ def main(base_path: Path | str | None = None) -> Path:
     if not results_csv.exists():
         raise FileNotFoundError(f"grid_results.csv missing at {results_csv}")
     df = pd.read_csv(results_csv)
+    # Outer-CV fold runs (run_id contains "_f<k>_") have a different held-out set
+    # per fold, so they cannot be paired with the single-split runs. The
+    # cross-validated McNemar tests are produced separately by outer_cv.py.
+    df = df[~df["run_id"].astype(str).str.contains(r"_f\d+_", regex=True)].copy()
 
     # --- Predictions for all five models (load from disk, no retraining) ---
     all_model_preds = _load_predictions(models_dir, df)

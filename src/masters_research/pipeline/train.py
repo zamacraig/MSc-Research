@@ -32,6 +32,7 @@ from masters_research.data import TemporalDataLoader
 from masters_research.pipeline.dataset import create_temporal_dataset
 from masters_research.models import TemporalSpatialNodeClassifier, SimpleGCNClassifier
 from masters_research.pipeline.temporal_quality import run_temporal_quality_audit, compare_splits
+from masters_research.pipeline import training_curves
 import seaborn as sns
 
 
@@ -752,6 +753,7 @@ def _train_one_fold(
     run_models_dir: Path,
     num_classes_run: int,
     trainval_dataset=None,
+    run_plots_dir: Path | None = None,
 ) -> dict:
     """
     Create a fresh model, run the training loop with early stopping, reload the best
@@ -759,7 +761,7 @@ def _train_one_fold(
 
     Returned dict keys:
         model, best_model_path, model_save_path, best_f1,
-        val_acc, val_f1, val_preds, val_labels, val_probs, duration.
+        val_acc, val_f1, val_preds, val_labels, val_probs, duration, history.
     """
     train_loader = TemporalDataLoader(train_dataset)
     val_loader   = TemporalDataLoader(val_dataset)
@@ -1042,6 +1044,12 @@ def _train_one_fold(
     prev_bn_stats = None              # Track BatchNorm stats between epochs
     f1_history = []                   # Track F1 for variance analysis
     diagnostic_interval = 5           # Print diagnostics every N epochs
+
+    # Learning-curve history (see pipeline/training_curves.py). The extra
+    # train-set pass is inference-only, so it does not alter the trajectory.
+    record_curves = bool(cfg_run.get("record_training_curves", cfg.get("record_training_curves", True)))
+    curve_history = []
+    selected_epoch = None
     
     for epoch in range(1, num_epochs + 1):
         # Learning rate warmup: linearly increase LR from warmup_start_lr to base_lr
@@ -1085,10 +1093,17 @@ def _train_one_fold(
         
         do_eval = (epoch % eval_interval == 0) or (epoch == num_epochs)
         if do_eval:
+            if record_curves:
+                tr_preds, tr_labels, tr_probs = test_model(model, train_loader)
             preds, labels, probs = test_model(model, val_loader)
             acc = accuracy_score(labels, preds)
             f1  = f1_score(labels, preds, average="weighted")
             f1_history.append(f1)  # Track for variance analysis
+            if record_curves:
+                curve_history.append(training_curves.history_row(
+                    epoch, tr_labels, tr_preds, tr_probs, labels, preds, probs,
+                    objective=float(loss), lr=float(optimizer.param_groups[0]['lr']),
+                ))
             current_lr = optimizer.param_groups[0]['lr']
             print(f"  [{fold_label}] Epoch {epoch:03d}/{num_epochs} | "
                   f"Loss: {loss:.4f} | Val Acc: {acc:.4f} | Val F1: {f1:.4f} | "
@@ -1131,6 +1146,7 @@ def _train_one_fold(
             if selection_score > best_f1 + min_delta:
                 best_f1          = selection_score
                 best_raw_f1      = f1
+                selected_epoch   = epoch
                 patience_counter = 0
                 if cfg_run.get("save_best", cfg.get("save_best", True)):
                     run_models_dir.mkdir(parents=True, exist_ok=True)
@@ -1179,6 +1195,7 @@ def _train_one_fold(
             model.load_state_dict(swa_model.module.state_dict())
             best_f1 = swa_f1
             best_raw_f1 = swa_f1
+            selected_epoch = None  # SWA average, not a single epoch
         elif best_model_path and Path(best_model_path).exists():
             model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
     elif best_model_path and Path(best_model_path).exists():
@@ -1196,6 +1213,15 @@ def _train_one_fold(
     model_save_path = fold_run_dir / f"temporal_spatial_classifier_state_{fold_label}.pth"
     torch.save(model.state_dict(), model_save_path)
 
+    if record_curves and curve_history:
+        _swa_used = use_swa and selected_epoch is None
+        training_curves.save_run_history(
+            curve_history, run_models_dir, run_plots_dir,
+            title=f"{type(model).__name__} - {fold_label}"
+                  + (" (final model = SWA average)" if _swa_used else ""),
+            selected_step=selected_epoch,
+        )
+
     return {
         "model":           model,
         "best_model_path": best_model_path,
@@ -1207,6 +1233,7 @@ def _train_one_fold(
         "val_labels":      val_labels,
         "val_probs":       val_probs,
         "duration":        duration,
+        "history":         curve_history,
     }
 
 
@@ -1337,6 +1364,7 @@ def main(base_path: Path, config_path: Path = None, cv_fold: int | None = None,
             base_path=base_path,
             cv_fold=cv_fold,
             n_outer_folds=n_outer_folds,
+            purge_heldout_lags=bool(cfg.get("purge_heldout_lags", False)),
         )
         
         # Dynamically determine in_channels from actual data
@@ -1391,6 +1419,12 @@ def main(base_path: Path, config_path: Path = None, cv_fold: int | None = None,
         final_test_loader = TemporalDataLoader(final_test_dataset)
 
         # Run grid of experiments
+        # baselines_only skips the GNN grid but keeps the identical dataset and
+        # splits, so baseline results can be refreshed without retraining GNNs.
+        if bool(cfg.get("baselines_only", False)):
+            print("\nbaselines_only=true: skipping the GNN grid; training baselines only.")
+            grid = []
+
         for run_idx, cfg_run in enumerate(grid, start=1):
             run_prefix = cfg.get("run_name", "run")
             if cv_fold is not None:
@@ -1500,6 +1534,7 @@ def main(base_path: Path, config_path: Path = None, cv_fold: int | None = None,
                         fold_id, fold_train, fold_val,
                         cfg_run, cfg, device, run_models_dir, num_classes_run,
                         trainval_dataset=trainval_dataset,
+                        run_plots_dir=run_plots_dir,
                     )
                     fold_results.append(result)
                     fold_val_datasets.append(fold_val)
@@ -1541,6 +1576,7 @@ def main(base_path: Path, config_path: Path = None, cv_fold: int | None = None,
                     run_id, train_dataset, val_dataset,
                     cfg_run, cfg, device, run_models_dir, num_classes_run,
                     trainval_dataset=trainval_dataset,
+                    run_plots_dir=run_plots_dir,
                 )
                 model           = result["model"]
                 final_acc       = result["val_acc"]
@@ -1898,6 +1934,11 @@ def main(base_path: Path, config_path: Path = None, cv_fold: int | None = None,
         # After all runs, generate summary plots
         _generate_summary_plots(results_path, plots_dir)
 
+        try:
+            training_curves.aggregate_curves(save_dir, plots_dir, run_prefix=cfg.get("run_name"))
+        except Exception as e:
+            print(f"Learning-curve aggregation skipped: {e}")
+
         # Emit the per-model best-run classification report and cross-model
         # comparison plots so results are ready to inspect without a follow-up command.
         try:
@@ -1926,6 +1967,15 @@ def main(base_path: Path, config_path: Path = None, cv_fold: int | None = None,
             run_explainability_report(base_path)
         except Exception as e:
             print(f"Model-level explainability aggregation skipped: {e}")
+
+        # Error analysis of the held-out predictions (single split; the rotating
+        # cross-validation runs it once over the pooled folds in outer_cv.py).
+        if cv_fold is None:
+            try:
+                from masters_research.pipeline.error_analysis import run_error_analysis
+                run_error_analysis(base_path, cfg, Path(save_dir), cfg.get("run_name", "run"), 1)
+            except Exception as e:
+                print(f"Error analysis skipped: {e}")
 
     except Exception:
         import traceback

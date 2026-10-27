@@ -6,22 +6,25 @@ the small dataset (~800 station-months) is a real bottleneck for the deep
 models or whether they are already at their achievable ceiling.
 
 For each training fraction f in {0.25, 0.50, 0.75, 1.0}:
-  - Keep the outer test set fixed (unchanged fraction of the full data).
-  - Keep the inner val set fixed (unchanged fraction of the trainval pool).
-  - Take the *last* f * N training snapshots (preserving temporal ordering —
-    subsampling from the tail keeps the training window contiguous with val
-    and mirrors how real deployments accumulate data).
-  - Train each of SimpleGCN, TemporalGCN_GRU, TemporalAttentionGNN once
-    (single seed) via the existing pipeline `_train_one_fold`.
-  - Train a plain RandomForest on the same station-month feature vectors
-    (rows) from the same subsampled window.
+  - Keep the outer test set fixed and the inner val set fixed, using the same
+    outer hold-out and deterministic inner split as pipeline.train.
+  - Keep the *last* f * N training snapshots (the most recent months).
+  - Train SimpleGCN, TemporalGCN_GRU and TemporalAttentionGNN through the
+    main training loop (`_train_one_fold`), and RandomForest / Keras MLP with
+    the exact settings of baselines_runner, once per seed.
+  - Score each model on its own training subset AND on the fixed test set.
+    Only labelled (station, month) cases are used, as in the main evaluation.
 
-Output:
-  - <plots_dir>/learning_curve.png   — test F1 vs fraction, one line per model
-  - <plots_dir>/learning_curve.csv   — raw numbers (fraction, model, test_f1)
+Output (prefixed with run_name when set):
+  - <plots_dir>/learning_curve.png          — train/test F1 vs fraction per model
+  - <plots_dir>/learning_curve.csv          — raw per-seed numbers
+  - <plots_dir>/learning_curve_summary.csv  — mean/std per (model, fraction)
+
+For per-epoch (or per-tree) learning curves of the main runs, see
+pipeline/training_curves.py.
 
 Standalone usage:
-    python -m masters_research.pipeline.learning_curve --seed 42
+    python -m masters_research.pipeline.learning_curve --config configs/spi3_ss_rerun.json
 """
 from __future__ import annotations
 
@@ -40,8 +43,13 @@ from sklearn.metrics import f1_score, accuracy_score
 from torch_geometric_temporal.signal import DynamicGraphTemporalSignalBatch, temporal_signal_split
 
 from masters_research.data.temporal_loader import TemporalDataLoader
-from masters_research.pipeline.dataset import create_temporal_dataset, interleaved_temporal_split
+from masters_research.pipeline.dataset import (
+    create_temporal_dataset, interleaved_temporal_split, stratified_temporal_signal_split,
+)
 from masters_research.pipeline.train import _train_one_fold, test_model
+from masters_research.pipeline.baselines_runner import (
+    flatten_snapshots, _fit_random_forest, _fit_keras_mlp,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -68,21 +76,8 @@ def _tail_subset(dataset: DynamicGraphTemporalSignalBatch, n_keep: int) -> Dynam
     )
 
 
-def _flatten_snapshots(dataset: DynamicGraphTemporalSignalBatch) -> tuple[np.ndarray, np.ndarray]:
-    """Concatenate every snapshot's node-feature and label tensors into
-    tabular arrays for sklearn baselines. Each row = one (station, month)."""
-    X, y = [], []
-    n = getattr(dataset, "snapshot_count", None) or len(dataset)
-    for i in range(n):
-        snap = dataset[i]
-        xi = snap.x.detach().cpu().numpy()
-        yi = snap.y.detach().cpu().numpy().astype(int)
-        X.append(xi); y.append(yi)
-    return np.concatenate(X, axis=0), np.concatenate(y, axis=0)
-
-
 # ---------------------------------------------------------------------------
-# Model runners
+# Model runners — each returns (train_f1, test_f1)
 # ---------------------------------------------------------------------------
 
 def _make_cfg(model_type: str, base_cfg: dict, seed: int) -> dict:
@@ -94,12 +89,19 @@ def _make_cfg(model_type: str, base_cfg: dict, seed: int) -> dict:
     cfg["use_simple_gcn"] = (model_type == "simple_gcn")
     cfg["use_temporal_attention"] = (model_type == "temporal_attention")
     cfg["use_attention"] = False
+    # Per-epoch curves are not needed here and would cost an extra pass per epoch.
+    cfg["record_training_curves"] = False
     return cfg
 
 
+def _f1(labels, preds) -> float:
+    return float(f1_score(labels, preds, average="weighted"))
+
+
 def _run_gnn(model_type: str, train_ds, val_ds, test_ds, base_cfg: dict, seed: int,
-             num_classes: int, run_models_dir: Path) -> float:
-    """Train a GNN via the existing pipeline and return test F1 on `test_ds`."""
+             num_classes: int, run_models_dir: Path) -> tuple[float, float]:
+    """Train a GNN via the main pipeline's training loop (same checkpoint
+    selection, SWA, early stopping) and score it on train and test."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     cfg_run = _make_cfg(model_type, base_cfg, seed)
@@ -108,75 +110,27 @@ def _run_gnn(model_type: str, train_ds, val_ds, test_ds, base_cfg: dict, seed: i
         train_dataset=train_ds,
         val_dataset=val_ds,
         cfg_run=cfg_run,
-        cfg=base_cfg,
+        cfg=cfg_run,
         device=torch.device("cpu"),
         run_models_dir=run_models_dir,
         num_classes_run=num_classes,
         trainval_dataset=None,
     )
-    test_loader = TemporalDataLoader(test_ds)
-    preds, labels, _ = test_model(result["model"], test_loader)
-    return float(f1_score(labels, preds, average="weighted"))
+    tr_preds, tr_labels, _ = test_model(result["model"], TemporalDataLoader(train_ds))
+    te_preds, te_labels, _ = test_model(result["model"], TemporalDataLoader(test_ds))
+    return _f1(tr_labels, tr_preds), _f1(te_labels, te_preds)
 
 
-def _run_rf(train_ds, test_ds, seed: int) -> float:
-    """Train a RandomForest on flattened (station-month, features) tabular data."""
-    X_tr, y_tr = _flatten_snapshots(train_ds)
-    X_te, y_te = _flatten_snapshots(test_ds)
-    # Deliberately small grid to keep the learning curve run cheap. RF is
-    # famously robust — even default hyperparameters give near-optimal
-    # results on small tabular datasets, so an expensive GridSearchCV would
-    # spend runtime on marginal improvements.
-    rf = RandomForestClassifier(
-        n_estimators=200,
-        max_depth=None,
-        min_samples_leaf=2,
-        random_state=seed,
-        n_jobs=-1,
-    )
-    rf.fit(X_tr, y_tr)
-    return float(f1_score(y_te, rf.predict(X_te), average="weighted"))
-
-
-def _run_keras(train_ds, test_ds, seed: int, num_classes: int, epochs: int = 60) -> float:
-    """Train a small MLP baseline mirroring the architecture used in
-    baselines/baseline_models.py (Dense 128 -> 64 -> 32 -> 32 -> softmax).
-
-    Kept as a separate, lazy-imported function so users who don't have
-    TensorFlow installed can still run the learning curve for RF+GNNs.
-    Fixed hyperparameters (no grid) to keep the per-fraction cost bounded.
-    """
-    import os
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")  # silence TF INFO/WARNING spam
-    import tensorflow as tf
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import Dense, Dropout, BatchNormalization, Input
-    from tensorflow.keras.utils import to_categorical
-
-    tf.keras.utils.set_random_seed(seed)
-
-    X_tr, y_tr = _flatten_snapshots(train_ds)
-    X_te, y_te = _flatten_snapshots(test_ds)
-    y_tr_1h = to_categorical(y_tr, num_classes=num_classes)
-
-    model = Sequential([
-        Input(shape=(X_tr.shape[1],)),
-        Dense(128, activation="relu"),
-        BatchNormalization(),
-        Dropout(0.3),
-        Dense(64, activation="relu"),
-        BatchNormalization(),
-        Dropout(0.3),
-        Dense(32, activation="relu"),
-        BatchNormalization(),
-        Dense(32, activation="relu"),
-        Dense(num_classes, activation="softmax"),
-    ])
-    model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
-    model.fit(X_tr, y_tr_1h, epochs=epochs, batch_size=32, verbose=0,
-              validation_split=0.1)
-    preds = np.argmax(model.predict(X_te, verbose=0), axis=1)
-    return float(f1_score(y_te, preds, average="weighted"))
+def _run_baseline(name: str, train_ds, test_ds, seed: int, cfg: dict, num_classes: int) -> tuple[float, float]:
+    """RF / Keras MLP with the exact settings used in the main comparison
+    (baselines_runner), on labelled station-month rows only."""
+    X_tr, y_tr = flatten_snapshots(train_ds)
+    X_te, y_te = flatten_snapshots(test_ds)
+    if name == "RandomForest":
+        model, predict = _fit_random_forest(X_tr, y_tr, seed, cfg)
+    else:
+        model, predict = _fit_keras_mlp(X_tr, y_tr, seed, cfg, num_classes)
+    return _f1(y_tr, predict(model, X_tr)[0]), _f1(y_te, predict(model, X_te)[0])
 
 
 # ---------------------------------------------------------------------------
@@ -184,42 +138,37 @@ def _run_keras(train_ds, test_ds, seed: int, num_classes: int, epochs: int = 60)
 # ---------------------------------------------------------------------------
 
 def _plot(df: pd.DataFrame, out_path: Path) -> None:
-    """Test F1 vs training fraction, one line per model.
+    """Train and test F1 vs training fraction, one panel per model.
 
-    If multiple seeds per (model, fraction) are present, the line is the
-    mean across seeds and a shaded band spans ±1 standard deviation —
-    which is what a proper learning curve looks like for noisy models.
+    Mean across seeds with a ±1 std band. The gap between the two lines is
+    the generalisation gap; a test line still rising at fraction 1.0 means
+    more data would help, a flat one means the model has saturated.
     """
-    fig, ax = plt.subplots(figsize=(8.5, 5))
-    order = ["SimpleGCN", "TemporalGCN_GRU", "TemporalAttentionGNN", "RandomForest", "KerasMLP"]
-    palette = {"SimpleGCN": "#1f77b4", "TemporalGCN_GRU": "#ff7f0e",
-               "TemporalAttentionGNN": "#2ca02c", "RandomForest": "#d62728",
-               "KerasMLP": "#9467bd"}
-    agg = df.groupby(["model", "train_fraction"])["test_f1"].agg(["mean", "std", "count"]).reset_index()
-    for model in order:
+    order = [m for m in ["SimpleGCN", "TemporalGCN_GRU", "TemporalAttentionGNN", "RandomForest", "KerasMLP"]
+             if m in set(df["model"])]
+    agg = (df.groupby(["model", "train_fraction"])[["train_f1", "test_f1"]]
+             .agg(["mean", "std"]).reset_index())
+    agg.columns = ["_".join(c).rstrip("_") for c in agg.columns]
+    n_seeds = int(df.groupby(["model", "train_fraction"]).size().max())
+    fig, axes = plt.subplots(1, len(order), figsize=(3.4 * len(order), 3.8), sharey=True, squeeze=False)
+    for ax, model in zip(axes[0], order):
         sub = agg[agg["model"] == model].sort_values("train_fraction")
-        if sub.empty:
-            continue
-        color = palette.get(model, None)
-        # Std of a single observation is NaN — fall back to 0 for plotting so the
-        # single-seed case degrades gracefully to a plain line.
-        stds = sub["std"].fillna(0.0).to_numpy()
-        means = sub["mean"].to_numpy()
-        fracs = sub["train_fraction"].to_numpy()
-        ax.plot(fracs, means, marker="o", linewidth=2, label=model, color=color)
-        if (stds > 0).any():
-            ax.fill_between(fracs, means - stds, means + stds, alpha=0.15, color=color)
-
-    ax.set_xlabel("Training-data fraction")
-    ax.set_ylabel("Test F1 (weighted, mean ±1 std across seeds)")
-    n_seeds = int(agg["count"].max()) if not agg.empty else 1
-    ax.set_title(f"Learning curve — sample efficiency across architectures (n_seeds={n_seeds})")
-    ax.set_ylim(0.0, 1.0)
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="lower right")
+        x = sub["train_fraction"].to_numpy()
+        for part, color, name in [("train", "#2a6fb0", "Train"), ("test", "#d0662b", "Test")]:
+            m = sub[f"{part}_f1_mean"].to_numpy()
+            sd = sub[f"{part}_f1_std"].fillna(0.0).to_numpy()
+            ax.plot(x, m, marker="o", linewidth=1.8, color=color, label=name)
+            ax.fill_between(x, m - sd, m + sd, alpha=0.15, color=color)
+        ax.set_title(model, fontsize=10)
+        ax.set_xlabel("Training-data fraction")
+        ax.set_ylim(0.0, 1.05)
+        ax.grid(True, alpha=0.3)
+    axes[0][0].set_ylabel("Weighted F1")
+    axes[0][0].legend(loc="lower right", fontsize=8)
+    fig.suptitle(f"Sample-size learning curves (mean ± 1 std, {n_seeds} seeds)")
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path)
+    fig.savefig(out_path, dpi=130)
     plt.close(fig)
 
 
@@ -256,10 +205,15 @@ def main(base_path: Path, config_path: Path, seeds: tuple[int, ...] = (42,),
     cfg["in_channels"] = int(dataset.features[0].shape[1])
     num_classes = int(cfg.get("num_classes", 3))
 
-    # Splits — mirror the training pipeline exactly.
+    # Splits — mirror the training pipeline exactly (same outer hold-out and
+    # same deterministic inner train/val rule as pipeline.train).
     test_holdout = float(cfg.get("test_holdout_ratio", 0.2))
     trainval, test_ds = interleaved_temporal_split(dataset, train_ratio=1.0 - test_holdout)
-    inner_train_full, val_ds = temporal_signal_split(trainval, train_ratio=cfg.get("train_ratio", 0.8))
+    if bool(cfg.get("stratified_split", False)):
+        inner_train_full, val_ds = stratified_temporal_signal_split(
+            trainval, train_ratio=float(cfg.get("train_ratio", 0.8)), num_classes=num_classes)
+    else:
+        inner_train_full, val_ds = temporal_signal_split(trainval, train_ratio=cfg.get("train_ratio", 0.8))
     n_train_full = inner_train_full.snapshot_count
     print(f"Learning curve setup: full inner-train = {n_train_full} snapshots, "
           f"val = {val_ds.snapshot_count}, test = {test_ds.snapshot_count}")
@@ -269,64 +223,48 @@ def main(base_path: Path, config_path: Path, seeds: tuple[int, ...] = (42,),
     plots_dir.mkdir(parents=True, exist_ok=True)
     models_dir.mkdir(parents=True, exist_ok=True)
 
+    gnns = [("simple_gcn", "SimpleGCN"), ("temporal_gru", "TemporalGCN_GRU"),
+            ("temporal_attention", "TemporalAttentionGNN")]
     rows = []
     for frac in fractions:
         n_keep = max(1, int(round(n_train_full * frac)))
         subs_train = _tail_subset(inner_train_full, n_keep)
-        print(f"\n=== Fraction {frac:.2f} -> training on {subs_train.snapshot_count} snapshots ===")
+        n_cases = int(flatten_snapshots(subs_train)[1].size)
+        print(f"\n=== Fraction {frac:.2f} -> {subs_train.snapshot_count} snapshots "
+              f"({n_cases} labelled cases) ===")
 
         for seed in seeds:
             print(f"\n  [seed={seed}]")
-            for model_type, pretty in [
-                ("simple_gcn", "SimpleGCN"),
-                ("temporal_gru", "TemporalGCN_GRU"),
-                ("temporal_attention", "TemporalAttentionGNN"),
-            ]:
+            jobs = [(pretty, lambda mt=mt, pretty=pretty: _run_gnn(
+                        mt, subs_train, val_ds, test_ds, cfg, seed, num_classes,
+                        models_dir / pretty / f"frac_{int(frac*100)}_seed_{seed}"))
+                    for mt, pretty in gnns]
+            jobs += [(name, lambda name=name: _run_baseline(name, subs_train, test_ds, seed, cfg, num_classes))
+                     for name in ("RandomForest", "KerasMLP")]
+            for pretty, job in jobs:
                 try:
-                    f1 = _run_gnn(
-                        model_type, subs_train, val_ds, test_ds, cfg, seed,
-                        num_classes, models_dir / pretty / f"frac_{int(frac*100)}_seed_{seed}",
-                    )
-                    print(f"    {pretty:22s} test F1 = {f1:.4f}")
+                    tr_f1, te_f1 = job()
+                    print(f"    {pretty:22s} train F1 = {tr_f1:.4f}  test F1 = {te_f1:.4f}")
                 except Exception as e:
                     print(f"    {pretty:22s} FAILED: {e}")
-                    f1 = float("nan")
+                    tr_f1 = te_f1 = float("nan")
                 rows.append({"model": pretty, "train_fraction": frac, "seed": seed,
-                             "n_train_snapshots": subs_train.snapshot_count, "test_f1": f1})
+                             "n_train_snapshots": subs_train.snapshot_count,
+                             "n_train_cases": n_cases, "train_f1": tr_f1, "test_f1": te_f1})
 
-            # RandomForest on the same (subsampled train, unchanged test).
-            try:
-                f1 = _run_rf(subs_train, test_ds, seed)
-                print(f"    {'RandomForest':22s} test F1 = {f1:.4f}")
-            except Exception as e:
-                print(f"    RandomForest           FAILED: {e}")
-                f1 = float("nan")
-            rows.append({"model": "RandomForest", "train_fraction": frac, "seed": seed,
-                         "n_train_snapshots": subs_train.snapshot_count, "test_f1": f1})
-
-            # Keras MLP baseline — mirrors baseline_models.py architecture.
-            # Wrapped in try/except so a missing TensorFlow install doesn't kill
-            # the whole learning-curve experiment.
-            try:
-                f1 = _run_keras(subs_train, test_ds, seed, num_classes)
-                print(f"    {'KerasMLP':22s} test F1 = {f1:.4f}")
-            except Exception as e:
-                print(f"    KerasMLP               FAILED: {e}")
-                f1 = float("nan")
-            rows.append({"model": "KerasMLP", "train_fraction": frac, "seed": seed,
-                         "n_train_snapshots": subs_train.snapshot_count, "test_f1": f1})
-
+    prefix = f"{cfg['run_name']}_" if cfg.get("run_name") else ""
     out_df = pd.DataFrame(rows)
-    out_csv = plots_dir / "learning_curve.csv"
+    out_csv = plots_dir / f"{prefix}learning_curve.csv"
     out_df.to_csv(out_csv, index=False)
-    out_png = plots_dir / "learning_curve.png"
+    out_png = plots_dir / f"{prefix}learning_curve.png"
     _plot(out_df, out_png)
 
     # Also emit a compact per-(model, fraction) mean±std summary.
-    agg = (out_df.groupby(["model", "train_fraction"])["test_f1"]
-                .agg(["mean", "std", "count"]).reset_index()
-                .sort_values(["train_fraction", "model"]))
-    agg_csv = plots_dir / "learning_curve_summary.csv"
+    agg = (out_df.groupby(["model", "train_fraction"])[["train_f1", "test_f1"]]
+                .agg(["mean", "std"]).round(4))
+    agg.columns = ["_".join(c) for c in agg.columns]
+    agg = agg.reset_index().sort_values(["model", "train_fraction"])
+    agg_csv = plots_dir / f"{prefix}learning_curve_summary.csv"
     agg.to_csv(agg_csv, index=False)
 
     print(f"\nSaved learning curve to:\n  {out_csv}\n  {out_png}\n  {agg_csv}")
@@ -337,9 +275,9 @@ def main(base_path: Path, config_path: Path, seeds: tuple[int, ...] = (42,),
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/improve_v1.json",
+    parser.add_argument("--config", default="configs/spi3_ss_rerun.json",
                         help="Base config for GNN hyperparameters (list-valued fields are collapsed to their first entry).")
-    parser.add_argument("--seeds", default="42,123,456",
+    parser.add_argument("--seeds", default="42,123,456,789,1024",
                         help="Comma-separated list of seeds. Each (model, fraction) is trained once per seed; the plot shows mean ± std across seeds.")
     args = parser.parse_args()
 

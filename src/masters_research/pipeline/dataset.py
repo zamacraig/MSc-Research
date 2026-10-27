@@ -84,61 +84,67 @@ def _apply_seasonal_normalization(
 
 def _add_temporal_lag_features(df: pd.DataFrame, lag_features: list[str], lags: list[int] = [1], rolling_windows: list[int] = [7]) -> pd.DataFrame:
     """
-    Add temporal lag and rolling mean features for each node.
-    
+    Add per-station lag, trailing rolling-mean and difference features.
+
+    `df` is the graph edge list (one row per station per neighbour per month),
+    so these are computed on a deduplicated one-row-per-station-month table and
+    merged back. Computing them directly on the edge list made the rolling
+    window span edge rows instead of months: every station-month has one row
+    per neighbour, so "roll7" averaged the previous month's value repeated and
+    was an exact copy of lag1.
+
+    "Previous" means the previous OBSERVED month for that station. Pruned months
+    leave gaps in the record, and a strict calendar lag would be undefined (and
+    zero-filled) after every gap; the most recent available observation is used
+    instead.
+
     Parameters
     ----------
-    df : pd.DataFrame
-        Input dataframe with TimeStamp and Compno_x columns
-    lag_features : list[str]
-        List of feature columns to create lags for
-    lags : list[int]
-        List of lag periods (default [1] = previous day)
-    rolling_windows : list[int]
-        List of rolling window sizes for mean (default [7] = 7-day average)
-    
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with added lag and rolling features
+    lag_features : feature columns to derive history features from
+    lags : lag periods in observed months (default [1])
+    rolling_windows : trailing-mean windows in observed months, excluding the
+        current month (default [7])
     """
     df = df.copy()
-    df = df.sort_values(["Compno_x", "TimeStamp"])
-    
+
+    node = (df[["Compno_x", "TimeStamp"] + lag_features]
+            .drop_duplicates(subset=["Compno_x", "TimeStamp"])
+            .copy())
+    node["_dt"] = _parse_timestamps(node["TimeStamp"]).values
+    node = node.sort_values(["Compno_x", "_dt"])
+    grouped = node.groupby("Compno_x")
+
     new_features = []
-    
     for feat in lag_features:
-        # Lag features (previous day values)
         for lag in lags:
             lag_col = f"{feat}_lag{lag}"
-            df[lag_col] = df.groupby("Compno_x")[feat].shift(lag)
+            node[lag_col] = grouped[feat].shift(lag)
             new_features.append(lag_col)
-        
-        # Rolling mean features (e.g., 7-day average)
+
         for window in rolling_windows:
             roll_col = f"{feat}_roll{window}"
-            df[roll_col] = df.groupby("Compno_x")[feat].transform(
+            node[roll_col] = grouped[feat].transform(
                 lambda x: x.shift(1).rolling(window=window, min_periods=1).mean()
             )
             new_features.append(roll_col)
-        
-        # Difference from previous day (captures trend/change)
+
         diff_col = f"{feat}_diff"
-        df[diff_col] = df.groupby("Compno_x")[feat].diff()
+        node[diff_col] = grouped[feat].diff()
         new_features.append(diff_col)
-    
-    # Fill NaN values created by lag/diff with 0 (first timestamps)
-    for col in new_features:
-        df[col] = df[col].fillna(0)
-    
+
+    # Each station's first observed month has no history.
+    node[new_features] = node[new_features].fillna(0)
+
+    df = df.merge(node[["Compno_x", "TimeStamp"] + new_features],
+                  on=["Compno_x", "TimeStamp"], how="left")
+
     print(f"Added {len(new_features)} temporal lag features:")
     for feat in new_features[:5]:
         print(f"  - {feat}")
     if len(new_features) > 5:
         print(f"  ... and {len(new_features) - 5} more")
-    
-    return df
 
+    return df
 
 def create_temporal_dataset(
     final_df: pd.DataFrame,
@@ -153,6 +159,7 @@ def create_temporal_dataset(
     base_path=None,
     cv_fold: int | None = None,
     n_outer_folds: int = 5,
+    purge_heldout_lags: bool = False,
 ) -> DynamicGraphTemporalSignalBatch:
     """
     Creates a temporal dataset from the final processed dataframe.
@@ -202,6 +209,14 @@ def create_temporal_dataset(
     stratified_split : bool, default False
         Match the caller's outer split strategy: True → interleaved
         every-k-th-timestamp split; False → chronological first-N split.
+    purge_heldout_lags : bool, default False
+        By default the lag / rolling / difference features are computed over each
+        station's full record, so with an interleaved split the raw value of a
+        held-out month can enter the history features of the next training month.
+        If True, the history features of trainval rows are recomputed from trainval
+        months only (the previous *trainval* month is used), while held-out rows keep
+        the true previous-month history, as they would at forecast time. This
+        is a sensitivity option; the default reproduces the reported results.
     """
     print("Creating temporal dataset...")
 
@@ -285,6 +300,20 @@ def create_temporal_dataset(
         # Chronological first-N scheme — mirrors temporal_signal_split.
         trainval_ts = sorted_ts[: n_total_ts - n_test_ts]
     trainval_mask = final_df["TimeStamp"].isin(trainval_ts)
+
+    if purge_heldout_lags and add_lag_features:
+        _hist_cols = [c for c in final_df.columns if ("_lag" in c or "_roll" in c or "_diff" in c)]
+        _base_cols = [c for c in ("AverageMaximumTemperature_x", "AverageTotalRadiation_x", "TotalRainfall_x")
+                      if c in final_df.columns]
+        if _hist_cols and _base_cols:
+            _tv = final_df.loc[trainval_mask].drop(columns=_hist_cols)
+            _tv = _add_temporal_lag_features(_tv, _base_cols)
+            _key = ["Compno_x", "TimeStamp"]
+            _upd = _tv[_key + _hist_cols].drop_duplicates(subset=_key)
+            _idx = final_df.index[trainval_mask]
+            _new = final_df.loc[_idx, _key].merge(_upd, on=_key, how="left")
+            final_df.loc[_idx, _hist_cols] = _new[_hist_cols].values
+            print("Purged held-out months from the history features of trainval rows.")
     print(f"Trainval mask: {int(trainval_mask.sum())}/{len(final_df)} rows "
           f"({100.0 * trainval_mask.mean():.1f}%) — used for leak-free fitting below.")
 
@@ -503,6 +532,19 @@ def create_temporal_dataset(
         for cls, cnt in dist.items():
             print(f"    Class {int(cls)}: {cnt} samples ({100.0 * cnt / total:.1f}%)")
 
+    # Edge weights decay with distance as exp(-d / L). L must be on the scale of
+    # the inter-station distances: with d in km and no scale (L = 1), stations
+    # 71-499 km apart got weights of 1e-31 or smaller, GCN normalisation then
+    # gave each node only its own self-loop, and the models' outputs were
+    # identical with or without edges. L is the median pairwise distance, which
+    # depends only on station geometry -- nothing is fitted to the data, so the
+    # choice cannot leak test information.
+    edge_length_scale_km = float(
+        final_df.drop_duplicates(subset=["Compno_x", "Compno_y"])["distance_km"].median()
+    )
+    print(f"Edge weights: exp(-distance / {edge_length_scale_km:.1f} km) "
+          f"(length scale = median station-pair distance).")
+
     # Timestamps
     timestamps = final_df["TimeStamp"].unique()
 
@@ -627,10 +669,9 @@ def create_temporal_dataset(
             dtype=torch.long,
         )
 
-        # Edge weights: INVERSE distance so closer stations have HIGHER influence
-        # Using exp(-distance) for smooth decay; epsilon prevents division by zero
+        # Closer stations get larger weights; see edge_length_scale_km above.
         distances = df_timestamp["distance_km"].values[keep]
-        edge_weights = torch.tensor(np.exp(distances * -1.0), dtype=torch.float)
+        edge_weights = torch.tensor(np.exp(-distances / edge_length_scale_km), dtype=torch.float)
 
         # Targets - must match node_features extraction (one per node, same order)
         targets_df = (
